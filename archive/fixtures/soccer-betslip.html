@@ -1,0 +1,62 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Mock Soccer Betslip</title>
+</head>
+<body>
+  <header>
+    <h1>Soccer</h1>
+    <p data-testid="login-status">Logged out</p>
+  </header>
+
+  <main>
+    <h2>Premier League</h2>
+
+    <article data-testid="match-arsenal-chelsea">
+      <h3>Arsenal vs Chelsea</h3>
+      <button data-testid="select-arsenal">Arsenal 1.80</button>
+      <button data-testid="select-draw">Draw 3.20</button>
+      <button data-testid="select-chelsea">Chelsea 4.00</button>
+    </article>
+
+    <article data-testid="match-city-liverpool">
+      <h3>Manchester City vs Liverpool</h3>
+      <button data-testid="select-city">Manchester City 1.90</button>
+      <button data-testid="select-liverpool">Liverpool 3.50</button>
+    </article>
+
+    <section aria-label="Betslip">
+      <h2>Betslip</h2>
+      <p data-testid="selection-count">Selections: 0</p>
+      <ul data-testid="bet-selections"></ul>
+    </section>
+  </main>
+
+  <script>
+    const selections = new Map();
+    const list = document.querySelector('[data-testid="bet-selections"]');
+    const count = document.querySelector('[data-testid="selection-count"]');
+
+    document.querySelectorAll('button[data-testid^="select-"]').forEach(button => {
+      button.addEventListener('click', () => {
+        const match = button.closest('article');
+        const matchName = match.querySelector('h3').textContent;
+        const selectionName = button.textContent.trim();
+
+        // One selection per match, matching a simplified betslip.
+        selections.set(match.dataset.testid, `${matchName}: ${selectionName}`);
+
+        list.replaceChildren();
+        for (const selection of selections.values()) {
+          const item = document.createElement('li');
+          item.textContent = selection;
+          list.appendChild(item);
+        }
+
+        count.textContent = `Selections: ${selections.size}`;
+      });
+    });
+  </script>
+</body>
+</html>

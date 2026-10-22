@@ -1,0 +1,377 @@
+﻿
+const http = require('node:http');
+const { spawn } = require('node:child_process');
+const { readFile, mkdtemp, rm } = require('node:fs/promises');
+const path = require('node:path');
+const os = require('node:os');
+
+const PORT = 3001;
+const HOST = '127.0.0.1';
+const PROJECT = path.resolve(__dirname, '..');
+
+let busy = false;
+
+const html = `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>HollywoodBets AI Testing Agent</title>
+<style>
+body {
+  font-family: Arial, sans-serif;
+  background: #15121f;
+  color: white;
+  margin: 0;
+}
+main {
+  max-width: 850px;
+  margin: 40px auto;
+  padding: 24px;
+}
+h1 { color: #f7c948; }
+#messages {
+  min-height: 350px;
+  background: #211b30;
+  padding: 20px;
+  border-radius: 12px;
+}
+.message {
+  padding: 14px;
+  margin: 12px 0;
+  background: #342a48;
+  border-radius: 8px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.user { border-left: 4px solid #f7c948; }
+.agent { border-left: 4px solid #8b7cf8; }
+form { display: flex; gap: 10px; margin-top: 20px; }
+input {
+  flex: 1;
+  padding: 14px;
+  border-radius: 8px;
+  border: none;
+}
+button {
+  background: #f7c948;
+  color: #17121f;
+  border: none;
+  padding: 14px 20px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+button:disabled { opacity: .5; }
+</style>
+</head>
+<body>
+<main>
+<h1>HollywoodBets AI Testing Agent</h1>
+<p>Local Qwen + E2E | Read-only testing POC</p>
+<div id="messages"></div>
+<form id="form">
+<input id="instruction"
+ maxlength="500"
+ placeholder="Enter a testing instruction..."
+ required>
+<button id="send">Run Test</button>
+</form>
+</main>
+<script>
+const form = document.getElementById('form');
+const input = document.getElementById('instruction');
+const messages = document.getElementById('messages');
+const send = document.getElementById('send');
+
+function addMessage(role, content) {
+  const div = document.createElement('div');
+  div.className = 'message ' + role;
+  div.textContent = content;
+  messages.appendChild(div);
+}
+
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  const instruction = input.value.trim();
+  if (!instruction) return;
+
+  addMessage('user', instruction);
+  input.value = '';
+  send.disabled = true;
+  addMessage('agent', 'Running test...');
+
+  const status = messages.lastElementChild;
+
+  try {
+    const response = await fetch('/api/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ instruction })
+    });
+
+    const result = await response.json();
+
+  <CodeBlock language="javascript" editable>
+if (!response.ok) {
+  status.textContent =
+    'ERROR\\n' +
+    'Code: ' + (result.code || 'UNKNOWN') + '\\n' +
+    'Reason: ' + (result.error || 'Unknown error');
+} else {
+  status.textContent =
+    (result.status || (result.success ? 'PASS' : 'FAIL')) +
+    (result.reason ? '\\nReason: ' + result.reason : '') +
+    (result.durationMs !== undefined
+      ? '\\nExecution time: ' + result.durationMs + ' ms'
+      : '') +
+    '\\n' + JSON.stringify(result.actions ?? [], null, 2);
+}
+</CodeBlock>  
+  } catch {
+    status.textContent = 'Unable to reach the test server.';
+  } finally {
+    send.disabled = false;
+  }
+});
+</script>
+</body>
+</html>`;
+
+function sendJson(res, status, data) {
+  res.writeHead(status, {
+    'Content-Type': 'application/json',
+    'Cache-Control': 'no-store',
+    'X-Content-Type-Options': 'nosniff'
+  });
+  res.end(JSON.stringify(data));
+}
+
+
+
+function runTest(instruction, reportPath) {
+  return new Promise((resolveRun, reject) => {
+    const e2eCli = path.join(
+      PROJECT,
+      'node_modules',
+      'e2e',
+      'dist',
+      'cli',
+      'bin.js'
+    );
+
+    const child = spawn(
+      process.execPath,
+      [
+  e2eCli,
+  'run',
+  '--config',
+  'e2e.edge-clean.config.ts',
+  'tests/agent-ai-demo.e2e.ts'
+],
+      {
+        cwd: PROJECT,
+        shell: false,
+        windowsHide: true,
+        env: {
+          ...process.env,
+          APP_URL: 'https://www.hollywoodbets.net/',
+          AGENT_INSTRUCTION: instruction,
+          AGENT_REPORT_PATH: reportPath
+        },
+        stdio: ['ignore', 'pipe', 'pipe']
+      }
+    );
+
+    let stdout = '';
+    let stderr = '';
+    let timedOut = false;
+
+    child.stdout.on('data', (chunk) => {
+      stdout = (stdout + chunk.toString()).slice(-12000);
+    });
+
+    child.stderr.on('data', (chunk) => {
+      stderr = (stderr + chunk.toString()).slice(-12000);
+    });
+
+    const timeout = setTimeout(() => {
+      timedOut = true;
+      child.kill();
+    }, 120000);
+
+    child.on('error', (error) => {
+      clearTimeout(timeout);
+      console.error('E2E launch error:', error.code);
+      reject(new Error('Unable to launch E2E process'));
+    });
+
+    child.on('close', (code, signal) => {
+      clearTimeout(timeout);
+
+      console.log('E2E exit code:', code);
+      console.log('E2E termination signal:', signal);
+
+      if (timedOut) {
+        reject(new Error('E2E test timed out'));
+        return;
+      }
+
+      if (code === 0) {
+        resolveRun(code);
+      } else {
+        // Local diagnostics only. Do not enable unrestricted
+        // output logging for authenticated production tests.
+        console.error('E2E stdout:', stdout);
+        console.error('E2E stderr:', stderr);
+
+        reject(
+          new Error('E2E process exited with code ' + code)
+        );
+      }
+    });
+  });
+}
+
+
+
+http.createServer(async (req, res) => {
+  const requestUrl = new URL(
+    req.url || '/',
+    'http://127.0.0.1:3001'
+  );
+
+  if (
+    requestUrl.pathname === '/' &&
+    req.method === 'GET'
+  ) {
+    res.writeHead(200, {
+      'Content-Type': 'text/html; charset=utf-8',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy':
+        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
+    });
+    return res.end(html);
+  }
+
+  if (req.url !== '/api/run' || req.method !== 'POST') {
+    return sendJson(res, 404, { error: 'Not found' });
+  }
+
+  if (busy) {
+    return sendJson(res, 409, {
+      error: 'Another test is running'
+    });
+  }
+
+  // Restrict requests to the local chat interface.
+  const origin = req.headers.origin;
+  if (origin !== 'http://' + HOST + ':' + PORT) {
+    return sendJson(res, 403, {
+      error: 'Invalid request origin'
+    });
+  }
+
+  let body = '';
+  for await (const chunk of req) {
+    body += chunk;
+    if (body.length > 4096) {
+      return sendJson(res, 413, {
+        error: 'Request too large'
+      });
+    }
+  }
+
+  let instruction;
+  try {
+    instruction = JSON.parse(body).instruction;
+  } catch {
+    return sendJson(res, 400, { error: 'Invalid JSON' });
+  }
+
+  if (
+    typeof instruction !== 'string' ||
+    !instruction.trim() ||
+    instruction.length > 500
+  ) {
+    return sendJson(res, 400, {
+      error: 'Invalid instruction'
+    });
+  }
+
+  // The production demo permits only read-only inspections.
+  if (
+  !/^(inspect|verify|check|report|navigate)\b/i.test(
+    instruction.trim()
+  )
+) {
+  return sendJson(res, 400, {
+    error: 'Only approved read-only testing requests are supported'
+  });
+}
+  busy = true;
+  let directory;
+
+  try {
+    directory = await mkdtemp(
+      path.join(os.tmpdir(), 'hwb-agent-')
+    );
+    const reportPath = path.join(directory, 'report.json');
+    const code = await runTest(instruction, reportPath);
+
+    let report;
+    try {
+      report = JSON.parse(
+        await readFile(reportPath, 'utf8')
+      );
+    } catch {
+      return sendJson(res, 500, {
+        error: 'Test did not produce a report'
+      });
+    }
+
+    return sendJson(res, 200, {
+      success: code === 0 && report.success === true,
+      actions: report.actions
+    });
+} catch (error) {
+  const message =
+    error instanceof Error ? error.message : '';
+
+  console.error(
+    '[Agent execution error]',
+    message
+  );
+
+  let code = 'EXECUTION_FAILED';
+  let userMessage = 'The test could not be completed.';
+
+  if (/LLM_UNAVAILABLE|Bad Gateway|HTTP 502/i.test(message)) {
+    code = 'LLM_UNAVAILABLE';
+    userMessage = 'The local Qwen service is unavailable.';
+  } else if (/timed out/i.test(message)) {
+    code = 'EXECUTION_TIMEOUT';
+    userMessage = 'The test exceeded its execution time limit.';
+  } else if (/launch|ENOENT|EINVAL/i.test(message)) {
+    code = 'BROWSER_RUNNER_ERROR';
+    userMessage = 'The E2E test runner could not be started.';
+  }
+
+  return sendJson(res, 500, {
+    success: false,
+    code,
+    error: userMessage
+  });
+} finally {
+    busy = false;
+    if (directory) {
+      await rm(directory, {
+        recursive: true,
+        force: true
+      });
+    }
+  }
+}).listen(PORT, HOST, () => {
+  console.log(
+    'AI Testing Agent: http://' + HOST + ':' + PORT
+  );
+});

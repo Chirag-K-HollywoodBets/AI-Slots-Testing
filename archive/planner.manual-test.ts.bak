@@ -1,0 +1,60 @@
+import { Plan, Action } from './types';
+import { Planner } from './planner';
+
+async function runPlannerTest() {
+  console.log('--- Starting Planner Test ---');
+
+  const planner = new Planner({
+    baseUrl: 'http://10.6.49.95:8007/gemma/v1',
+    modelName: 'Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf',
+  });
+
+  const testCases = [
+    {
+      name: 'Valid instruction: Navigate and check visibility',
+      instruction: 'Go to the sports page and check if the live banner is visible.',
+      shouldPass: true,
+    },
+    {
+      name: 'Invalid instruction: Disallowed path',
+      instruction: 'Go to https://google.com',
+      shouldPass: false,
+    },
+    {
+      name: 'Invalid instruction: Malformed JSON (Simulated by instruction)',
+      instruction: 'Respond with invalid json format please',
+      shouldPass: false,
+    },
+    {
+      name: 'Invalid instruction: Unsupported action',
+      instruction: 'Click the login button',
+      shouldPass: false,
+    },
+  ];
+
+  for (const tc of testCases) {
+    console.log(`\nTesting: ${tc.name}`);
+    console.log(`Instruction: "${tc.instruction}"`);
+    try {
+      const plan = await planner.plan(tc.instruction);
+      console.log('✅ Plan generated successfully:');
+      console.log(JSON.stringify(plan, null, 2));
+
+      if (!tc.shouldPass) {
+        console.error('❌ Expected failure but plan was generated.');
+      }
+    } catch (error: any) {
+      console.log(`⚠️ Plan rejected as expected: ${error.message}`);
+      if (tc.shouldPass) {
+        console.error('❌ Expected success but plan was rejected.');
+      }
+    }
+  }
+
+  console.log('\n--- Planner Test Completed ---');
+}
+
+runPlannerTest().catch((err) => {
+  console.error('Test runner failed:', err);
+  process.exit(1);
+});

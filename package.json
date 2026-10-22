@@ -1,0 +1,37 @@
+{
+  "name": "hollywoodbets-e2e-poc",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test:e2e": "e2e run",
+    "test:agent": "tsx tests/agent/schema.test.ts"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.14.0",
+      "onFail": "download"
+    }
+  },
+  "packageManager": "pnpm@12.14.0",
+  "type": "module",
+  "devDependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.71",
+    "@e2e-dev/web": "^0.15.2",
+    "@types/node": "^26.6.5",
+    "ai": "^7.0.143",
+    "e2e": "^0.21.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.5",
+    "zod": "^4.1.8"
+  },
+  "dependencies": {
+    "@ai-sdk/openai": "^4.0.98"
+  }
+}
