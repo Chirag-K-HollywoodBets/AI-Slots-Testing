@@ -20,7 +20,9 @@ pnpm install
 Start Edge with a clean profile and remote debugging enabled:
 
 ```powershell
-msedge.exe --remote-debugging-port=9223 --user-data-dir="C:\path\to\clean-edge-profile"
+Get-Process msedge -ErrorAction SilentlyContinue | Stop-Process -Force
+Start-Process "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe" -ArgumentList '--remote-debugging-port=9223', "--user-data-dir=$env:TEMP\edge-e2e-clean", '--no-first-run'
+Start-Sleep 3; Invoke-RestMethod http://127.0.0.1:9223/json/version
 ```
 
 Set the test account credentials in the same terminal used to start the chat server:
