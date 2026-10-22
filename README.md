@@ -28,9 +28,9 @@ Start-Sleep 3; Invoke-RestMethod http://127.0.0.1:9223/json/version
 Set the test account credentials in the same terminal used to start the chat server:
 
 ```powershell
-$env:E2E_USER_HB_TEST_USERNAME = "<test-account-username>"
-$env:E2E_USER_HB_TEST_PASSWORD = "<test-account-password>"
-$env:E2E_TELEMETRY_DISABLED = "1" # optional
+$env:E2E_USER_HB_TEST_USERNAME = "0111113372"
+$env:E2E_USER_HB_TEST_PASSWORD = "P@55w05d01**"
+
 ```
 
 ## Run
