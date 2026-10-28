@@ -4,6 +4,7 @@ import {
   executePlan,
   type BrowserAdapter,
 } from '../../src/agent/executor';
+import { MAX_SPINS } from '../../src/agent/schema';
 
 function mockBrowser(): BrowserAdapter {
   return {
@@ -21,6 +22,14 @@ function mockBrowser(): BrowserAdapter {
       { stake: 0.2, win: 0, balance: 99.8 },
       { stake: 0.2, win: 0.5, balance: 100.1 },
     ]),
+    prepareSportsBet: vi.fn().mockResolvedValue({
+      betType: 'single',
+      selections: [{ fixture: 'Nottingham Forest vs Example FC', selection: 'Nottingham Forest', market: 'Match Result' }],
+      market: 'match-winner',
+      stakeCents: 500,
+      status: 'BETSLIP_READY',
+      submitted: false,
+    }),
   };
 }
 
@@ -169,8 +178,63 @@ describe('Browser Executor', () => {
     });
   });
 
+  it('rejects an unsupported requested stake before opening the game', async () => {
+    const browser = mockBrowser();
+    const report = await executePlan({
+      thought: 'Play at the requested stake',
+      actions: [
+        { type: 'open_game', game: 'games-in-olympus' },
+        { type: 'play_slot', game: 'games-in-olympus', spins: 2, stake: 0.21 },
+      ],
+    }, browser);
+    expect(report.success).toBe(false);
+    expect(browser.openGame).not.toHaveBeenCalled();
+    expect(browser.playSlot).not.toHaveBeenCalled();
+  });
+
+  it('reports a pre-spin failure as zero completed and zero attempted spins', async () => {
+    const browser = mockBrowser();
+    const failure = Object.assign(new Error('BET_NOT_AT_STAKE'), { completedSpins: 0, attemptedSpins: 0 });
+    vi.mocked(browser.playSlot).mockRejectedValue(failure);
+    const report = await executePlan({
+      thought: 'Play the verified stake',
+      actions: [
+        { type: 'open_game', game: 'games-in-olympus' },
+        { type: 'play_slot', game: 'games-in-olympus', spins: 2, stake: 0.2 },
+      ],
+    }, browser);
+    expect(report.results[1].observation).toEqual({
+      completedSpins: 0, attemptedSpins: 0, stoppedBeforeAnySpin: true,
+    });
+  });
+
+  it('prepares the approved sports betslip without submitting it', async () => {
+    const browser = mockBrowser();
+    const report = await executePlan({
+      thought: 'Prepare the requested test betslip.',
+      actions: [{
+        type: 'prepare_sports_bet',
+        competition: 'premier-league',
+        selections: [{ team: 'Arsenal' }],
+        market: 'match-winner',
+        stakeCents: 500,
+        submit: false,
+      }],
+    }, browser);
+
+    expect(report.success).toBe(true);
+    expect(browser.prepareSportsBet).toHaveBeenCalledWith(
+      'premier-league', [{ team: 'Arsenal' }], 'match-winner', 500, false
+    );
+    expect(report.results[0].observation).toMatchObject({
+      status: 'BETSLIP_READY',
+      submitted: false,
+      stakeCents: 500,
+    });
+  });
+
   it.each([
-    ['too many spins', { spins: 11, stake: 0.2 }],
+    ['too many spins', { spins: MAX_SPINS + 1, stake: 0.2 }],
     ['zero spins', { spins: 0, stake: 0.2 }],
     ['unapproved stake', { spins: 1, stake: 5 }],
   ])('rejects %s without touching the browser', async (_name, extra) => {
@@ -213,6 +277,7 @@ describe('Browser Executor', () => {
       {
         thought: 'Spin then check',
         actions: [
+          { type: 'open_game', game: 'games-in-olympus' },
           { type: 'play_slot', game: 'games-in-olympus', spins: 3, stake: 0.2 },
           { type: 'get_page_info' },
         ],
@@ -221,8 +286,8 @@ describe('Browser Executor', () => {
     );
 
     expect(report.success).toBe(false);
-    expect(report.results).toHaveLength(1);
-    expect(report.results[0].error).toBe('STAKE_MISMATCH');
+    expect(report.results).toHaveLength(2);
+    expect(report.results[1].error).toBe('STAKE_MISMATCH');
     expect(browser.getPageInfo).not.toHaveBeenCalled();
   });
 });

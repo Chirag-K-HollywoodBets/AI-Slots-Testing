@@ -4,9 +4,12 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run tests/agent tests/chat",
+    "test:unit": "vitest run tests/agent tests/chat",
+    "typecheck": "tsc --noEmit",
     "test:e2e": "e2e run",
-    "test:agent": "tsx tests/agent/schema.test.ts"
+    "test:agent": "vitest run tests/agent",
+    "midscene:inspect-slots": "tsx scripts/midscene/inspect-olympus.ts"
   },
   "keywords": [],
   "author": "",
@@ -23,9 +26,12 @@
   "devDependencies": {
     "@ai-sdk/openai-compatible": "^3.0.71",
     "@e2e-dev/web": "^0.15.2",
+    "@midscene/web": "^1.17.0",
+    "@playwright/test": "^1.64.1",
     "@types/node": "^26.6.5",
     "ai": "^7.0.143",
     "e2e": "^0.21.2",
+    "playwright": "^1.64.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2",
     "vitest": "^5.0.5",

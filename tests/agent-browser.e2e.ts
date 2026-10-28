@@ -8,13 +8,14 @@ import { createE2EBrowserAdapter } from
 
 test(
   'validated plan executes against the real browser',
-  async ({ app, browser }) => {
+  async ({ app, browser, screen }) => {
     await app.open('/');
 
     const adapter = createE2EBrowserAdapter(
       browser,
       app,
-      'https://www.hollywoodbets.net/'
+      'https://www.hollywoodbets.net/',
+      screen
     );
 
     const plan = {

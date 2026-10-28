@@ -14,7 +14,7 @@ const SITE_URL = 'https://www.hollywoodbets.net/';
 test(
   'confirmed casino plan executes as the test account',
   { session: 'hb-test', timeout: 600_000, tags: ['wager'] },
-  async ({ app, browser }) => {
+  async ({ app, browser, screen }) => {
     const planPath = process.env.AGENT_PLAN_PATH;
     const reportPath = process.env.AGENT_REPORT_PATH;
 
@@ -39,7 +39,7 @@ test(
 
     await app.open('/');
 
-    const adapter = createE2EBrowserAdapter(browser, app, SITE_URL);
+    const adapter = createE2EBrowserAdapter(browser, app, SITE_URL, screen);
     const started = Date.now();
     const report = await executePlan(plan, adapter);
     const durationMs = Date.now() - started;
@@ -53,7 +53,18 @@ test(
         success: r.success,
         ...('game' in r.action ? { game: r.action.game } : {}),
         ...(r.action.type === 'play_slot'
-          ? { spins: r.action.spins, stake: r.action.stake, result: r.observation ?? null }
+          ? {
+            spins: r.action.spins,
+            stake: r.action.stake,
+            result: Array.isArray(r.observation)
+              ? {
+                spins: r.observation,
+                completedSpins: r.observation.length,
+                attemptedSpins: r.observation.length,
+                stoppedBeforeAnySpin: false,
+              }
+              : r.observation ?? null,
+          }
           : {}),
         ...(r.error ? { error: r.error } : {}),
       })),

@@ -19,6 +19,9 @@
     "tests/agent-browser.e2e.ts",
     "tests/agent-live-sports.e2e.ts",
     "tests/agent-slot.e2e.ts",
+    "tests/agent-sports.e2e.ts",
+    "tests/chat/**/*.ts",
+    "tests/agent-sports-verify.e2e.ts",
     "tests/setup/**/*.ts",
     "tests/diagnostics/**/*.ts",
     "scripts/**/*.ts"

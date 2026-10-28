@@ -8,13 +8,14 @@ import { createE2EBrowserAdapter } from
 
 test(
   'agent verifies Live Sports event cards',
-  async ({ app, browser }) => {
+  async ({ app, browser, screen }) => {
     await app.open('/');
 
     const adapter = createE2EBrowserAdapter(
       browser,
       app,
-      'https://www.hollywoodbets.net/'
+      'https://www.hollywoodbets.net/',
+      screen
     );
 
     // First execute navigation and retrieve page information.

@@ -24,7 +24,7 @@ const SITE_URL = 'https://www.hollywoodbets.net/';
 
 test(
   'AI instruction executes against HollywoodBets',
-  async ({ app, browser }) => {
+  async ({ app, browser, screen }) => {
 
     const instruction =
       process.env.AGENT_INSTRUCTION ??
@@ -159,7 +159,8 @@ test(
     const adapter = createE2EBrowserAdapter(
       browser,
       app,
-      SITE_URL
+      SITE_URL,
+      screen
     );
 
     const started = Date.now();

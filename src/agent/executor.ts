@@ -1,4 +1,5 @@
 
+import { SportsPreparationError } from './sports-preparation';
 import {
   PlanSchema,
   type AgentAction,
@@ -8,6 +9,27 @@ export interface SpinResult {
   stake: number;
   win: number;
   balance: number;
+}
+
+export interface SportsBetPreview {
+  betType: 'single' | 'accumulator';
+  selections: Array<{ fixture: string; selection: string; market: string; decimalOdds?: number; displayedOdds?: number }>;
+  market: string;
+  stakeCents: number;
+  status: 'BETSLIP_READY';
+  submitted: false;
+  combinedOdds?: number;
+  oddsBasis?: 'decimal' | 'sportsbook-displayed';
+  displayedPayoutCents?: number;
+  displayedPayoutBasis?: 'stake-inclusive' | 'sportsbook-payout';
+  payoutMultiplier?: number;
+  payoutEffectiveDecimalOdds?: number;
+  payoutAdjustmentCents?: number;
+  bonusStatus?: 'unverified';
+  potentialPayoutCents?: number | null;
+  potentialProfitCents?: number | null;
+  payoutLimitCents?: number;
+  potentialWinningsCapped?: boolean;
 }
 
 export interface BrowserAdapter {
@@ -27,6 +49,15 @@ export interface BrowserAdapter {
 
   /** Plays N spins at a fixed stake. Must stop on the first stake mismatch. */
   playSlot(game: string, spins: number, stake: number): Promise<SpinResult[]>;
+
+  /** Sports preparation fails closed until provider limits and controls are verified. */
+  prepareSportsBet(
+    competition: string,
+    selections: Array<{ team: string; opponent?: string }>,
+    market: string,
+    stakeCents: number,
+    submit: boolean
+  ): Promise<SportsBetPreview>;
 }
 
 export interface ActionResult {
@@ -96,15 +127,25 @@ export async function executePlan(
             action.spins,
             action.stake
           );
-          const round = (n: number) => Math.round(n * 100) / 100;
+          const asCents = (n: number) => Math.round(n * 100);
           observation = {
             spins,
-            totalStaked: round(spins.reduce((s, x) => s + x.stake, 0)),
-            totalWon: round(spins.reduce((s, x) => s + x.win, 0)),
+            totalStaked: spins.reduce((s, x) => s + asCents(x.stake), 0) / 100,
+            totalWon: spins.reduce((s, x) => s + asCents(x.win), 0) / 100,
             finalBalance: spins.at(-1)?.balance ?? null,
           };
           break;
         }
+
+        case 'prepare_sports_bet':
+          observation = await browser.prepareSportsBet(
+            action.competition,
+            action.selections,
+            action.market,
+            action.stakeCents,
+            action.submit
+          );
+          break;
       }
 
       results.push({
@@ -115,9 +156,18 @@ export async function executePlan(
     } catch (error) {
       // Only expose our own short error codes, never raw page/network text.
       const message = error instanceof Error ? error.message : '';
+      const slotFailure = error instanceof Error && 'completedSpins' in error && 'attemptedSpins' in error
+        ? {
+          completedSpins: Number(error.completedSpins),
+          attemptedSpins: Number(error.attemptedSpins),
+          stoppedBeforeAnySpin: Number(error.attemptedSpins) === 0,
+        }
+        : undefined;
       results.push({
         action,
         success: false,
+        ...(slotFailure ? { observation: slotFailure } : {}),
+        ...(error instanceof SportsPreparationError ? { observation: error.preparation } : {}),
         error: /^[A-Z_]+$/.test(message) ? message : 'Browser action failed',
       });
 
