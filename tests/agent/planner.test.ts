@@ -119,6 +119,41 @@ describe('Planner', () => {
       planner.plan('Inspect homepage')
     ).rejects.toThrow('AI generation failed');
   });
+
+  it('interprets clarification separately from executable planning and supplies the saved unknown fields', async () => {
+    const pending = { selections: [{ team: 'Arsenal', opponent: null }], competition: null, market: 'match-winner', stakeCents: null };
+    const interpretation = { kind: 'answer_to_clarification', updates: {
+      selections: [{ index: 0, opponent: { value: 'Chelsea', evidence: 'Chelsea' } }],
+    } };
+    mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify(interpretation) });
+    const result = await planner.interpretSportsMessage('Chelsea', pending);
+    expect(result.interpretation).toEqual(interpretation);
+    expect(mockGenerateText).toHaveBeenCalledWith(expect.objectContaining({
+      prompt: JSON.stringify({ pending, message: 'Chelsea', outstandingClarification: null, recentContext: [] }),
+    }));
+    expect(result).not.toHaveProperty('actions');
+    expect(pending.stakeCents).toBeNull();
+  });
+
+  it('rejects action plans or invented interpretation fields from the conversation interpreter', async () => {
+    mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify({
+      kind: 'new_request', updates: { stakeCents: 1000 },
+    }) });
+    await expect(planner.interpretSportsMessage('Prepare Arsenal', null)).rejects.toThrow();
+    mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify({
+      thought: 'Prepare', actions: [{ type: 'get_page_info' }],
+    }) });
+    await expect(planner.interpretSportsMessage('Prepare Arsenal', null)).rejects.toThrow();
+  });
+
+  it('continues to return existing complete slot plans', async () => {
+    const plan = { thought: 'Play slots', actions: [
+      { type: 'open_game', game: 'games-in-olympus' },
+      { type: 'play_slot', game: 'games-in-olympus', spins: 10, stake: 0.2 },
+    ] };
+    mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify(plan) });
+    expect(await planner.plan('Log in, open Games in Olympus and play 10 spins at R0.20')).toEqual(plan);
+  });
   it('returns a valid blocked response', async () => {
   const refusal = {
     status: 'blocked',

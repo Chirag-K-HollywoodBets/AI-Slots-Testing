@@ -14,8 +14,9 @@ import {
 } from '../schema';
 import type { BrowserAdapter, SpinResult, SportsBetPreview } from '../executor';
 import {
-  calculatePotential,
-  capSoccerMultipleWinnings,
+  calculateAccumulatorBaseOdds,
+  applyObservedAccumulatorBonus,
+  payoutCentsAtDisplayedOdds,
   soccerMultiplePayoutLimitCents,
   fixtureMatchesTeams,
   parseStakeToCents,
@@ -654,7 +655,8 @@ export function createE2EBrowserAdapter(
           throw new Error('BETSLIP_TYPE_NOT_VERIFIED');
         }
 
-        const potential = calculatePotential(stakeCents, requestedRows.map((row) => 1 + row.fractionalOdds));
+        const baseOdds = betType === 'single' ? requestedRows[0].fractionalOdds
+          : calculateAccumulatorBaseOdds(requestedRows.map((row) => row.fractionalOdds));
         failedStage = 'SPORTS_PAYOUT';
         const displayedPayoutField = screen.getByLabel(SPORTSBOOK.payoutLabel, { exact: true });
         const displayedPayoutText = await displayedPayoutField.count() === 1
@@ -662,13 +664,13 @@ export function createE2EBrowserAdapter(
           : '';
         // Preserve the sportsbook's Payout verbatim. For a single the confirmed
         // rule is displayed odds * stake; never add the stake to that amount.
-        const displayedPayoutBasis = betType === 'single' ? 'sportsbook-payout' : 'stake-inclusive';
+        const displayedPayoutBasis = betType === 'single' ? 'sportsbook-payout' : 'unverified';
         const { payoutCents: displayedPayoutCents } = verifySportsAmounts(
           await stakeField.inputValue(), displayedPayoutText, stakeCents);
-        if (!potential) throw new Error('SPORTS_ODDS_UNVERIFIED');
+        if (baseOdds === null || baseOdds === undefined) throw new Error('SPORTS_ODDS_UNVERIFIED');
         const basePayoutCents = betType === 'single'
-          ? Math.round(stakeCents * requestedRows[0].fractionalOdds) : potential.potentialPayoutCents;
-        if (betType === 'single' && Math.abs(displayedPayoutCents - basePayoutCents) > 1) {
+          ? payoutCentsAtDisplayedOdds(stakeCents, requestedRows[0].fractionalOdds) : null;
+        if (betType === 'single' && (basePayoutCents === null || Math.abs(displayedPayoutCents - basePayoutCents) > 1)) {
           throw new Error('SPORTS_PAYOUT_BASIS_UNVERIFIED');
         }
         const singleLimit = soccerMultiplePayoutLimitCents(1, requestedRows.map((row) => row.fractionalOdds));
@@ -679,8 +681,15 @@ export function createE2EBrowserAdapter(
             payoutLimitCents: singleLimit,
             capped: displayedPayoutCents > singleLimit,
           }
-          : capSoccerMultipleWinnings(stakeCents, displayedPayoutCents, requestedRows.map((row) => row.fractionalOdds));
-        if (!capped) throw new Error('SOCCER_PAYOUT_LIMIT_UNAVAILABLE');
+          : null;
+        if (betType === 'single' && !capped) throw new Error('SOCCER_PAYOUT_LIMIT_UNAVAILABLE');
+
+        // No stable sportsbook fields for accumulator base odds, applied bonus,
+        // final odds, or payout basis are present in the verified selector contract.
+        // Keep derived base math separate and never infer a bonus/profit from payout.
+        const observedBonusPercent: number | null = null;
+        const finalOdds = betType === 'single' ? baseOdds
+          : observedBonusPercent === null ? null : applyObservedAccumulatorBonus(baseOdds, observedBonusPercent);
 
         return {
           betType,
@@ -695,16 +704,17 @@ export function createE2EBrowserAdapter(
           stakeCents,
           status: 'BETSLIP_READY',
           submitted: false,
-          combinedOdds: betType === 'single' ? requestedRows[0].fractionalOdds : potential.combinedOdds,
-          oddsBasis: betType === 'single' ? 'sportsbook-displayed' : 'decimal',
+          combinedOdds: baseOdds,
+          baseOdds,
+          ...(betType === 'accumulator' ? { observedBonusPercent, finalOdds } : {}),
+          oddsBasis: betType === 'single' ? 'sportsbook-displayed' : 'fractional-accumulator-calculation',
           displayedPayoutCents,
           displayedPayoutBasis,
           payoutMultiplier: displayedPayoutCents / stakeCents,
-          ...(betType === 'accumulator' ? { payoutEffectiveDecimalOdds: displayedPayoutCents / stakeCents } : {}),
-          payoutAdjustmentCents: displayedPayoutCents - basePayoutCents,
+          payoutAdjustmentCents: basePayoutCents === null ? null : displayedPayoutCents - basePayoutCents,
           bonusStatus: 'unverified',
-          potentialPayoutCents: capped?.potentialPayoutCents ?? null,
-          potentialProfitCents: capped?.potentialProfitCents ?? null,
+          potentialPayoutCents: betType === 'single' ? capped?.potentialPayoutCents ?? null : null,
+          potentialProfitCents: betType === 'single' ? capped?.potentialProfitCents ?? null : null,
           ...(capped ? { payoutLimitCents: capped.payoutLimitCents, potentialWinningsCapped: capped.capped } : {}),
         };
       } catch (error) {

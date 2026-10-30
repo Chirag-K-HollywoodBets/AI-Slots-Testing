@@ -11,10 +11,20 @@ export const SPORTSBOOK = {
   slipItem: '[data-testid="bet-item-container"]',
   slipName: '[data-testid="bet-name"]',
   slipInfo: '[data-testid="bet-info"]',
+  slipOdds: '[data-testid="bet-odds"]',
+  stakeInput: '[data-testid="input-stake"]',
+  payoutInput: '[data-testid="input-payout"]',
   emptySlipText: 'Place a bet',
   multiple: 'Multiple',
   accumulator: 'Multiple Accumulator',
   stakeLabel: 'Stake',
   payoutLabel: 'Payout',
-  waits: { page: 30_000, navigation: 15_000, control: 10_000, poll: 250 },
+  bonusLabel: 'Bonus',
+  finalOddsLabel: 'Final odds',
+  marketText: 'match winner',
+  submitButton: '[data-testid="betslip-container"] button[data-testid="submit-btn"]',
+  betslipContainer: '[data-testid="betslip-container"]',
+  // The result budget starts after the single click and is independent of the
+  // review authorization expiry, which is checked immediately before dispatch.
+  waits: { page: 30_000, navigation: 15_000, control: 10_000, poll: 250, submissionResult: 30_000 },
 } as const;

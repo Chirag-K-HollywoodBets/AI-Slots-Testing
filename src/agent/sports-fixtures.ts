@@ -21,6 +21,16 @@ export function canonicalTeamName(value: string): string {
   return TEAM_ALIASES[normalized] ?? normalized;
 }
 
+/** Established aliases only; unknown names retain the user's spelling. */
+export function establishedTeamName(value: string): string {
+  const canonical = TEAM_ALIASES[normalizeWords(value)];
+  return canonical ? canonical.replace(/\b\w/g, (letter) => letter.toUpperCase()) : value;
+}
+
+export function establishedTeamAliases(): Readonly<Record<string, string>> {
+  return { ...TEAM_ALIASES };
+}
+
 export function fixtureMatchesTeams(fixture: string, team: string, opponent?: string): boolean {
   const sides = fixture.split(/\s+(?:vs\.?|v)\s+/i).map(canonicalTeamName);
   if (sides.length !== 2 || !sides.includes(canonicalTeamName(team))) return false;
@@ -214,4 +224,26 @@ export function calculatePotential(stakeCents: number, decimalOdds: readonly num
   const combinedOdds = Number(numerator) / Number(denominator);
   if (!Number.isFinite(combinedOdds)) return null;
   return { combinedOdds, potentialPayoutCents, potentialProfitCents: potentialPayoutCents - stakeCents };
+}
+
+/** The sportsbook's accumulator basis is the product of (fractional leg odds + 1), minus 1. */
+export function calculateAccumulatorBaseOdds(fractionalOdds: readonly number[]): number | null {
+  if (fractionalOdds.length < 2 || fractionalOdds.some((odds) => !Number.isFinite(odds) || odds < 0)) return null;
+  let product = 1;
+  for (const odds of fractionalOdds) product *= odds + 1;
+  if (!Number.isFinite(product)) return null;
+  return Math.round((product - 1 + Number.EPSILON) * 100) / 100;
+}
+
+/** Apply only a bonus percentage actually observed in the sportsbook UI. */
+export function applyObservedAccumulatorBonus(baseOdds: number, bonusPercent: number): number | null {
+  if (!Number.isFinite(baseOdds) || baseOdds < 0 || !Number.isFinite(bonusPercent) || bonusPercent < 0) return null;
+  return Math.round((baseOdds * (1 + bonusPercent / 100) + Number.EPSILON) * 100) / 100;
+}
+
+/** The reviewed displayed odds are the payout multiplier supplied for this slip. */
+export function payoutCentsAtDisplayedOdds(stakeCents: number, displayedOdds: number): number | null {
+  if (!Number.isSafeInteger(stakeCents) || stakeCents <= 0 || !Number.isFinite(displayedOdds) || displayedOdds < 0) return null;
+  const payout = Math.round(stakeCents * displayedOdds);
+  return Number.isSafeInteger(payout) ? payout : null;
 }

@@ -1,6 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import {
   calculatePotential,
+  calculateAccumulatorBaseOdds,
+  applyObservedAccumulatorBonus,
+  payoutCentsAtDisplayedOdds,
   capSoccerMultipleWinnings,
   parseDisplayedMoneyToCents,
   parseStakeToCents,
@@ -78,6 +81,16 @@ describe('sports wager validation helpers', () => {
     });
     expect(calculatePotential(1000, [])).toBeNull();
     expect(calculatePotential(1000, [0])).toBeNull();
+  });
+
+  it('uses the owner-supplied fractional accumulator formula and applies only an observed bonus', () => {
+    const baseOdds = calculateAccumulatorBaseOdds([3.00, 1.95]);
+    expect(baseOdds).toBe(10.8);
+    const finalOdds = applyObservedAccumulatorBonus(baseOdds!, 2.5);
+    expect(finalOdds).toBe(11.07);
+    expect(payoutCentsAtDisplayedOdds(1000, finalOdds!)).toBe(11_070);
+    expect(applyObservedAccumulatorBonus(baseOdds!, Number.NaN)).toBeNull();
+    expect(calculateAccumulatorBaseOdds([3.0])).toBeNull();
   });
 
   it('uses the supplied soccer-multiple bonus tiers', () => {

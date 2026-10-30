@@ -59,17 +59,26 @@ function preparationReviewPayload(report, reviewId, expiresAt) {
   if (!betslip || betslip.status !== 'BETSLIP_READY' || betslip.submitted !== false
     || !Number.isSafeInteger(betslip.stakeCents) || betslip.stakeCents <= 0 || betslip.stakeCents > 5000
     || !Number.isSafeInteger(betslip.displayedPayoutCents) || betslip.displayedPayoutCents < 0
-    || !['sportsbook-payout', 'stake-inclusive'].includes(betslip.displayedPayoutBasis)
-    || !Number.isSafeInteger(betslip.potentialPayoutCents) || betslip.potentialPayoutCents < 0
-    || betslip.potentialPayoutCents > betslip.displayedPayoutCents
+    || !['sportsbook-payout', 'stake-inclusive', 'unverified'].includes(betslip.displayedPayoutBasis)
     || (betslip.betType === 'single'
-      ? betslip.displayedPayoutBasis !== 'sportsbook-payout' || betslip.potentialProfitCents !== null
-      : betslip.displayedPayoutBasis !== 'stake-inclusive'
-        || !Number.isSafeInteger(betslip.potentialProfitCents)
-        || betslip.potentialProfitCents < 0
-        || betslip.potentialProfitCents !== betslip.potentialPayoutCents - betslip.stakeCents)
-    || betslip.market !== 'match-winner' || !Array.isArray(betslip.selections)
-    || betslip.selections.length === 0) return null;
+      ? betslip.displayedPayoutBasis !== 'sportsbook-payout'
+        || !Number.isSafeInteger(betslip.potentialPayoutCents) || betslip.potentialPayoutCents < 0
+        || betslip.potentialPayoutCents > betslip.displayedPayoutCents || betslip.potentialProfitCents !== null
+      : betslip.displayedPayoutBasis === 'unverified'
+        ? betslip.potentialPayoutCents !== null || betslip.potentialProfitCents !== null
+        : betslip.displayedPayoutBasis !== 'stake-inclusive'
+          || !Number.isSafeInteger(betslip.potentialPayoutCents) || betslip.potentialPayoutCents < 0
+          || betslip.potentialPayoutCents > betslip.displayedPayoutCents
+          || !Number.isSafeInteger(betslip.potentialProfitCents)
+          || betslip.potentialProfitCents < 0
+          || betslip.potentialProfitCents !== betslip.potentialPayoutCents - betslip.stakeCents)
+    || betslip.market !== 'match-winner' || !['single', 'accumulator'].includes(betslip.betType)
+    || !Array.isArray(betslip.selections) || betslip.selections.length === 0
+    || (betslip.betType === 'single' ? betslip.selections.length !== 1 : betslip.selections.length < 2)
+    || betslip.selections.some((selection) => !selection || typeof selection.fixture !== 'string'
+      || !selection.fixture.trim() || typeof selection.selection !== 'string' || !selection.selection.trim()
+      || selection.market !== 'match-winner' || !Number.isFinite(selection.displayedOdds)
+      || selection.displayedOdds < 0)) return null;
   return { status: 'REVIEW_READY', reviewId, expiresAt, actions: [{ type: 'prepare_sports_bet', betslip }] };
 }
 

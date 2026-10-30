@@ -1,11 +1,22 @@
-// Preparation-only sports runner. Final submission remains a manual user action.
+// Sports runner: preparation is model-directed, while final submission is application-authorized.
 import { test } from '@e2e-dev/web';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
+import { submitReviewedSportsBet } from '../src/agent/sports-submission';
 
 import { executePlan } from '../src/agent/executor';
 import { isSportsWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter } from '../src/agent/adapters/e2e-browser';
+import { SPORTSBOOK } from '../src/agent/adapters/sportsbook-contract';
+
+function sanitizeSubmissionResult(value: Record<string, unknown>) {
+  let outcome = ['accepted', 'rejected', 'unknown', 'changed', 'blocked'].includes(String(value.outcome))
+    ? String(value.outcome) : 'unknown';
+  const reference = typeof value.betReference === 'string' ? value.betReference.trim() : '';
+  if (outcome === 'accepted' && !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(reference)) outcome = 'unknown';
+  return { outcome, reason: typeof value.reason === 'string' ? value.reason.slice(0, 240) : undefined,
+    betReference: reference && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(reference) ? reference : undefined };
+}
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
 
@@ -15,7 +26,7 @@ test(
     session: 'hb-test',
     timeout: 950_000,
     tags: ['wager'],
-    agentContext: "Prepare and verify the requested soccer betslip only. The authenticated session comes from the terminal-configured test-account credentials; no separate client ID is required. Never submit any sports wager from this runner; leave the final Submit click to the user.",
+    agentContext: "Prepare and verify the requested soccer betslip only. The authenticated session comes from the terminal-configured dedicated test-account credentials; no separate client ID is required. Never submit during preparation or from model output. The application-owned review protocol may perform one final click only after explicit chat authorization.",
   },
   async ({ app, browser, screen }) => {
     const planPath = process.env.AGENT_PLAN_PATH;
@@ -28,25 +39,52 @@ test(
       await writeFile(reportPath, JSON.stringify(data, null, 2), 'utf8');
     }
 
-    async function pauseForManualReview(betslip: Record<string, unknown>) {
+    async function pauseForManualReview(betslip: Record<string, unknown>): Promise<'finished' | 'expired' | 'browser_closed' | 'server_stopped' | 'submission_blocked' | 'submission_complete'> {
       const id = process.env.AGENT_REVIEW_ID;
       const readyPath = process.env.AGENT_REVIEW_READY_PATH;
       const decisionPath = process.env.AGENT_REVIEW_DECISION_PATH;
       const statePath = process.env.AGENT_REVIEW_STATE_PATH;
+      const resultPath = process.env.AGENT_SUBMISSION_RESULT_PATH;
       const timeoutMs = Number(process.env.AGENT_REVIEW_TIMEOUT_MS);
-      if (!id || !readyPath || !decisionPath || !statePath || !Number.isFinite(timeoutMs)
+      if (!id || !readyPath || !decisionPath || !statePath || !resultPath || !Number.isFinite(timeoutMs)
         || timeoutMs < 1_000 || timeoutMs > 600_000) throw new Error('REVIEW_CONFIGURATION_INVALID');
       const expiresAt = Date.now() + timeoutMs;
       await mkdir(dirname(readyPath), { recursive: true });
-      await writeFile(readyPath, JSON.stringify({ id, expiresAt, betslip, submitted: false }), 'utf8');
+      await writeFile(readyPath, JSON.stringify({ id, runId: process.env.AGENT_REVIEW_RUN_ID,
+        sessionId: process.env.AGENT_CHAT_SESSION_ID, revision: Number(process.env.AGENT_REVIEW_REVISION),
+        expiresAt, betslip, submitted: false }), 'utf8');
 
-      let outcome: 'finished' | 'expired' | 'browser_closed' | 'server_stopped' = 'expired';
+      let outcome: 'finished' | 'expired' | 'browser_closed' | 'server_stopped' | 'submission_blocked' | 'submission_complete' = 'expired';
       while (Date.now() < expiresAt) {
         try {
-          const decision = JSON.parse(await readFile(decisionPath, 'utf8')) as { id?: string; runId?: string };
+          const decision = JSON.parse(await readFile(decisionPath, 'utf8')) as {
+            id?: string; runId?: string; decision?: 'finish' | 'submit'; authorization?: string;
+            sessionId?: string; revision?: number; expiresAt?: number; fingerprint?: string; reviewedDetails?: unknown;
+          };
           if (decision.id === id && decision.runId === process.env.AGENT_REVIEW_RUN_ID) {
-            outcome = 'finished';
-            break;
+            if (decision.decision === 'finish') { outcome = 'finished'; break; }
+            if (decision.decision === 'submit' && decision.authorization && decision.fingerprint
+              && decision.sessionId && Number.isSafeInteger(decision.revision)
+              && decision.expiresAt && decision.expiresAt > Date.now()) {
+              const ready = JSON.parse(await readFile(readyPath, 'utf8'));
+              if (ready.id !== id || ready.runId !== decision.runId || ready.sessionId !== decision.sessionId
+                || ready.revision !== decision.revision || ready.expiresAt !== decision.expiresAt
+                || ready.expiresAt <= Date.now()) {
+                outcome = 'submission_blocked';
+                break;
+              }
+              // The runner owns the browser. The command carries no replacement slip;
+              // the review fingerprint binds the server-minted authorization.
+              let result: Record<string, unknown>;
+              try {
+                result = await submitReviewedSportsBet(browser, decision, betslip);
+              } catch {
+                result = { outcome: 'unknown', reason: 'Submission attempted—acceptance unverified. Check My Bets before trying again.' };
+              }
+              await writeFile(resultPath, JSON.stringify({ id, runId: process.env.AGENT_REVIEW_RUN_ID,
+                authorization: decision.authorization, ...sanitizeSubmissionResult(result) }), 'utf8');
+              outcome = 'submission_complete'; break;
+            }
           }
         } catch (error) {
           if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
@@ -147,6 +185,24 @@ test(
     } else if (outcome === 'server_stopped') {
       safeReport.status = 'REVIEW_CLOSED';
       safeReport.reason = 'The chat server stopped and closed the review; no bet was submitted.';
+    } else if (outcome === 'submission_blocked') {
+      safeReport.status = 'SUBMISSION_BLOCKED';
+      safeReport.reason = 'Live sportsbook submission is blocked because final controls and acceptance evidence are unverified.';
+    } else if (outcome === 'submission_complete') {
+      const resultPath = process.env.AGENT_SUBMISSION_RESULT_PATH;
+      try {
+        const result = JSON.parse(await readFile(resultPath!, 'utf8'));
+        safeReport.status = result.outcome === 'accepted' ? 'BET_ACCEPTED'
+          : result.outcome === 'rejected' ? 'BET_REJECTED'
+            : ['changed', 'blocked'].includes(result.outcome) ? 'SUBMISSION_BLOCKED' : 'BET_OUTCOME_UNKNOWN';
+        safeReport.reason = result.reason || 'Submission attempted—acceptance unverified. Check My Bets before trying again.';
+        if (typeof result.betReference === 'string' && result.betReference) {
+          Object.assign(safeReport, { betReference: result.betReference });
+        }
+      } catch {
+        safeReport.status = 'BET_OUTCOME_UNKNOWN';
+        safeReport.reason = 'Submission attempted—acceptance unverified. Check My Bets before trying again.';
+      }
     } else {
       safeReport.status = 'REVIEW_FINISHED';
       safeReport.reason = 'Review finished — no bet submitted';

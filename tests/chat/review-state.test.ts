@@ -59,7 +59,8 @@ describe('manual sportsbook review state', () => {
   });
 
   it('exposes only preparation review and never enables submission or My Bets verification', () => {
-    const betslip = { selections: [{ fixture: 'Arsenal vs Chelsea', team: 'Arsenal' }], market: 'match-winner', stakeCents: 1000,
+    const betslip = { selections: [{ fixture: 'Arsenal vs Chelsea', selection: 'Arsenal', market: 'match-winner', displayedOdds: 1.5 },
+      { fixture: 'Liverpool vs Everton', selection: 'Liverpool', market: 'match-winner', displayedOdds: 1.2 }], market: 'match-winner', stakeCents: 1000,
       status: 'BETSLIP_READY', submitted: false, displayedPayoutCents: 2500,
       displayedPayoutBasis: 'stake-inclusive', betType: 'accumulator',
       potentialPayoutCents: 2500, potentialProfitCents: 1500 };
@@ -68,13 +69,18 @@ describe('manual sportsbook review state', () => {
     expect(payload).toMatchObject({ status: 'REVIEW_READY', reviewId: 'review-id', actions: [{ betslip }] });
     expect(payload).not.toHaveProperty('verificationId');
     expect(payload?.actions[0].betslip.submitted).toBe(false);
+    const unverifiedAccumulator = { ...betslip, displayedPayoutBasis: 'unverified', potentialPayoutCents: null,
+      potentialProfitCents: null, bonusStatus: 'unverified', combinedOdds: 10.8, baseOdds: 10.8,
+      observedBonusPercent: null, finalOdds: null, oddsBasis: 'fractional-accumulator-calculation' };
+    expect(preparationReviewPayload({ status: 'BETSLIP_READY', success: true,
+      actions: [{ type: 'prepare_sports_bet', betslip: unverifiedAccumulator }] }, 'x', 1)).not.toBeNull();
     for (const field of ['stakeCents', 'displayedPayoutCents', 'displayedPayoutBasis', 'potentialPayoutCents', 'potentialProfitCents']) {
       expect(preparationReviewPayload({ status: 'BETSLIP_READY', success: true,
         actions: [{ type: 'prepare_sports_bet', betslip: { ...betslip, [field]: null } }] }, 'x', 1)).toBeNull();
     }
     expect(preparationReviewPayload({ status: 'BET_SUBMISSION_SENT', success: true,
       actions: [{ type: 'prepare_sports_bet', betslip: { ...betslip, submitted: true } }] }, 'x', 1)).toBeNull();
-    const single = { ...betslip, betType: 'single', displayedPayoutCents: 650, displayedPayoutBasis: 'sportsbook-payout',
+    const single = { ...betslip, betType: 'single', selections: [betslip.selections[0]], displayedPayoutCents: 650, displayedPayoutBasis: 'sportsbook-payout',
       potentialPayoutCents: 650, potentialProfitCents: null };
     expect(preparationReviewPayload({ status: 'BETSLIP_READY', success: true,
       actions: [{ type: 'prepare_sports_bet', betslip: single }] }, 'x', 1)).not.toBeNull();

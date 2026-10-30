@@ -8,13 +8,46 @@ const os = require('node:os');
 const { withUsage, pendingPlan } = require('./usage.cjs');
 const { describeSlotPlan } = require('./slot-summary.cjs');
 const { createReviewState, preparationReviewPayload, busyRejects } = require('./review-state.cjs');
-const { extractExplicitStakeCents } = require('./sports-stake.cjs');
+const { createChatSessions, clearSportsConfirmations, takeConfirmation, cancelConfirmation,
+  sportsRequestFingerprint, sportsPlanMatchesRequest, rememberMessage, replaceMessageResult } = require('./session-state.cjs');
+const { CONFIRM_WINDOW_MS } = require('./timeouts.cjs');
+const { createSubmissionState, fingerprint } = require('./submission-state.cjs');
+// Covers runner revalidation, one control click, bounded result observation,
+// and file transport. Authorization expiry is enforced before dispatch only.
+const SUBMISSION_RESULT_TIMEOUT_MS = 60_000;
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function submitThroughRunner({ review, betslip, authorization, sessionId, revision, expiresAt, reviewedDetails }) {
+  if (!review.reviewDecisionPath || !review.submissionResultPath || !authorization) {
+    return { outcome: 'blocked', reason: 'The browser runner is unavailable for this review.' };
+  }
+  const command = { id: review.id, runId: review.runId, decision: 'submit', authorization,
+    sessionId, revision, expiresAt, fingerprint: fingerprint(reviewedDetails), reviewedDetails };
+  try { await writeFile(review.reviewDecisionPath, JSON.stringify(command), 'utf8'); }
+  catch { return { outcome: 'blocked', reason: 'The browser runner is unavailable for this review.' }; }
+  if (expiresAt <= Date.now()) return { outcome: 'blocked', reason: 'Submission authorization expired before dispatch.' };
+  const deadline = Date.now() + SUBMISSION_RESULT_TIMEOUT_MS;
+  while (Date.now() < deadline) {
+    try {
+      const result = JSON.parse(await readFile(review.submissionResultPath, 'utf8'));
+      if (result.id === review.id && result.runId === review.runId && result.authorization === authorization
+        && ['accepted', 'rejected', 'unknown', 'changed', 'blocked'].includes(result.outcome)) {
+        if (result.outcome === 'accepted' && !(typeof result.betReference === 'string'
+          && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(result.betReference))) continue;
+        return { outcome: result.outcome,
+          ...(typeof result.reason === 'string' ? { reason: result.reason.slice(0, 240) } : {}),
+          ...(typeof result.betReference === 'string' ? { betReference: result.betReference } : {}) };
+      }
+    } catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) return { outcome: 'unknown' }; }
+    await sleep(100);
+  }
+  return { outcome: 'unknown' };
+}
 
 const PORT = 3001;
 const HOST = '127.0.0.1';
 const PROJECT = path.resolve(__dirname, '..');
 
-let busy = false;
 const reviews = createReviewState();
 let activeReview = null;
 const configuredReviewTimeout = Number(process.env.SPORTS_REVIEW_TIMEOUT_MS ?? 300_000);
@@ -22,14 +55,34 @@ const REVIEW_TIMEOUT_MS = Number.isFinite(configuredReviewTimeout)
   ? Math.min(600_000, Math.max(30_000, Math.floor(configuredReviewTimeout)))
   : 300_000;
 
-// Wager plans wait here until the user confirms them. Keyed by a random id,
-// so the plan itself never round-trips through the browser.
-const pendingPlans = new Map();
-const CONFIRM_WINDOW_MS = 2 * 60 * 1000;
+// Drafts and confirmation plans belong to the opaque browser chat session.
 
 const READ_ONLY_TEST = 'tests/agent-ai-demo.e2e.ts';
 const SLOT_TEST = 'tests/agent-slot.e2e.ts';
 const SPORTS_TEST = 'tests/agent-sports.e2e.ts';
+const EXECUTION_MODES = ['SPORTS', 'SLOTS_INSPECT', 'SLOTS_PLAY'];
+let inspectionBusy = false;
+async function runMidsceneInspection(instruction) {
+  const startedAt = Date.now();
+  const directory = await mkdtemp(path.join(os.tmpdir(), 'hwb-midscene-'));
+  const screenshotPath = path.join(directory, 'inspection.png');
+  try {
+    const tsxCli = path.join(PROJECT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+    const { code, stdout, stderr } = await runNode([tsxCli, 'scripts/midscene/inspect-olympus.ts'],
+      { MIDSCENE_SCREENSHOT_PATH: screenshotPath, MIDSCENE_INSTRUCTION: instruction }, 180000);
+    const line = stdout.split(/\r?\n/).find((item) => item.startsWith('MIDSCENE_RESULT:'));
+    let result = line ? JSON.parse(line.slice('MIDSCENE_RESULT:'.length)) : null;
+    if (!result) {
+      const unavailable = /ECONNREFUSED|ETIMEDOUT|ENOTFOUND|MODEL_UNAVAILABLE|fetch failed/i.test(stderr + stdout);
+      result = { status: unavailable ? 'MODEL_UNAVAILABLE' : 'MIDSCENE_INSPECTION_FAILED', success: false,
+        error: unavailable ? 'MODEL_UNAVAILABLE' : 'MIDSCENE_INSPECTION_FAILED', logs: (stderr + stdout).slice(-4000) };
+    }
+    if (code !== 0 && result.success) result = { ...result, success: false, status: 'MIDSCENE_INSPECTION_FAILED' };
+    return { ...result, mode: 'SLOTS_INSPECT', durationMs: Date.now() - startedAt,
+      logs: (result.logs || (stdout + stderr)).slice(-4000),
+      screenshot: result.screenshot || (await readFile(screenshotPath).then((b) => b.toString('base64')).catch(() => null)) };
+  } finally { await rm(directory, { recursive: true, force: true }); }
+}
 
 const html = `<!DOCTYPE html>
 <html lang="en">
@@ -82,232 +135,28 @@ button {
   cursor: pointer;
 }
 button:disabled { opacity: .5; }
+#conversation-status { color: #f7c948; min-height: 1.5em; }
+.message[data-state="clarification"] { border-left-color: #6dd6bc; }
+.message[data-state="awaiting_confirmation"] { border-left-color: #f7c948; }
+.message[data-state="manual_review"] { border-left-color: #6dd6bc; }
 </style>
 </head>
 <body>
 <main>
 <h1>HollywoodBets AI Testing Agent</h1>
-<p>Local Qwen + E2E | Read-only checks, confirmed test-account slots, and fail-closed sportsbook requests</p>
-<div id="messages"></div>
+<p>Review every prepared sports bet carefully. Submission is available only through the explicit chat control.</p>
+<p id="conversation-status" role="status" aria-live="polite">Ready for your request</p>
+<div id="messages" role="log" aria-label="Conversation" aria-live="polite"></div>
 <form id="form">
+<select id="mode" aria-label="Execution mode"><option value="SLOTS_INSPECT">Slots inspection</option><option value="SPORTS">Sportsbook</option><option value="SLOTS_PLAY">Slots play (disabled)</option></select>
 <input id="instruction"
  maxlength="500"
- placeholder="Enter a testing instruction..."
+ placeholder="Describe a request or answer a question..."
  required>
-<button id="send">Run Test</button>
+<button id="send">Send</button>
 </form>
 </main>
-<script>
-const form = document.getElementById('form');
-const input = document.getElementById('instruction');
-const messages = document.getElementById('messages');
-const send = document.getElementById('send');
-
-function addMessage(role, content) {
-  const div = document.createElement('div');
-  div.className = 'message ' + role;
-  div.textContent = content;
-  messages.appendChild(div);
-  return div;
-}
-
-function render(status, response, result) {
-  if (!response.ok) {
-    status.textContent =
-      'ERROR\\n' +
-      'Code: ' + (result.code || 'UNKNOWN') + '\\n' +
-      'Reason: ' + (result.error || 'Unknown error');
-    return;
-  }
-
-  const usageText = result.usage && result.usage.source === 'reported'
-    ? '\\nToken usage (provider reported): ' +
-      [result.usage.inputTokens !== undefined ? 'input ' + result.usage.inputTokens : '',
-       result.usage.outputTokens !== undefined ? 'output ' + result.usage.outputTokens : '',
-       result.usage.totalTokens !== undefined ? 'total ' + result.usage.totalTokens : '']
-        .filter(Boolean).join(', ') +
-      (result.usage.model ? '\\nModel: ' + result.usage.model : '')
-    : '';
-
-  if (result.status === 'CONFIRM') {
-    status.textContent = 'CONFIRMATION NEEDED\\n' + result.summary + usageText + '\\n';
-    const yes = document.createElement('button');
-    yes.textContent = 'Confirm and run';
-    const no = document.createElement('button');
-    no.textContent = 'Cancel';
-    no.style.marginLeft = '8px';
-    status.append(yes, no);
-
-    yes.onclick = async () => {
-      yes.remove(); no.remove();
-      const running = addMessage('agent', 'Running confirmed plan...');
-      send.disabled = true;
-      try {
-        const r = await fetch('/api/confirm', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ planId: result.planId })
-        });
-        render(running, r, await r.json());
-      } catch {
-        running.textContent = 'Unable to reach the test server.';
-      } finally {
-        send.disabled = false;
-      }
-    };
-    no.onclick = () => {
-      yes.remove(); no.remove();
-      status.textContent += '\\nCancelled. Nothing was run.';
-    };
-    return;
-  }
-
-  if (result.status === 'REVIEW_READY') {
-    const prepared = (result.actions || []).find((action) => action.type === 'prepare_sports_bet');
-    const bet = prepared && prepared.betslip;
-    const selectionsText = bet && Array.isArray(bet.selections)
-      ? bet.selections.map((selection) => selection.fixture + ': ' + selection.selection).join('\\n')
-      : '';
-    status.textContent = 'BETSLIP READY — AWAITING REVIEW\\n' +
-      (bet ? 'Selections:\\n' + selectionsText + '\\nBet type: ' + bet.betType +
-        '\\nMarket: ' + (bet.market === 'match-winner' ? 'Match winner' : bet.market) +
-        '\\nBase odds (' + (bet.oddsBasis === 'sportsbook-displayed' ? 'sportsbook displayed' : 'combined decimal, before bonus') + '): ' + (Number.isFinite(bet.combinedOdds) ? Number(bet.combinedOdds).toFixed(3) : 'unavailable') +
-        '\\nDisplayed payout / stake multiplier: ' + (Number.isFinite(bet.payoutMultiplier) ? Number(bet.payoutMultiplier).toFixed(3) : 'unavailable') +
-        '\\nBonus: unverified; displayed payout adjustment from base: R' + (Number(bet.payoutAdjustmentCents) / 100).toFixed(2) +
-        '\\nSportsbook displayed Payout: R' + (Number(bet.displayedPayoutCents) / 100).toFixed(2) +
-        '\\nTotal stake: R' + (Number(bet.stakeCents) / 100).toFixed(2) +
-        '\\nPotential payout (after configured cap): ' + (Number.isSafeInteger(bet.potentialPayoutCents)
-          ? 'R' + (Number(bet.potentialPayoutCents) / 100).toFixed(2) : 'unavailable') +
-        '\\nPotential profit: ' + (Number.isSafeInteger(bet.potentialProfitCents)
-          ? 'R' + (Number(bet.potentialProfitCents) / 100).toFixed(2) : 'unavailable') + '\\n' : '') +
-      'Potential winnings are not guaranteed and depend on settlement rules.\\n' +
-      'This review is available only while this session remains open. The agent did not submit. If you choose to proceed, click Submit in the sportsbook yourself.\\nExpires: ' +
-      new Date(result.expiresAt).toLocaleString() + '\\n' + usageText;
-    const finish = document.createElement('button');
-    finish.textContent = 'Finish review';
-    status.appendChild(finish);
-    let reviewPoll;
-    finish.onclick = async () => {
-      finish.disabled = true;
-      try {
-        const r = await fetch('/api/finish-review', {
-          method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ reviewId: result.reviewId })
-        });
-        const ended = await r.json();
-        if (!r.ok) throw new Error(ended.error || 'Review could not be finished.');
-        clearInterval(reviewPoll);
-        finish.remove();
-        status.append('\\nReview finished. The agent did not submit the bet.');
-      } catch (error) {
-        status.append('\\n' + (error && error.message ? error.message : String(error)));
-        finish.disabled = false;
-      }
-    };
-    reviewPoll = setInterval(async () => {
-      try {
-        const response = await fetch('/api/review-status?reviewId=' + encodeURIComponent(result.reviewId));
-        const current = await response.json();
-        if (current.status === 'REVIEW_READY') return;
-        clearInterval(reviewPoll);
-        render(status, { ok: true }, current);
-      } catch {
-        // Keep the finish control visible while the server may reconnect.
-      }
-    }, 1000);
-    return;
-  }
-
-  if (result.status === 'REVIEW_EXPIRED' || result.status === 'REVIEW_CLOSED') {
-    status.textContent = result.status === 'REVIEW_EXPIRED'
-      ? 'Review expired — no bet submitted'
-      : (result.reason || 'Review ended because its browser session closed. No bet was submitted.');
-    return;
-  }
-
-  if (result.status === 'REVIEW_STARTING') {
-    status.textContent = 'Preparing the confirmed betslip...';
-    const reviewId = result.reviewId;
-    const poll = async () => {
-      try {
-        const response = await fetch('/api/review-status?reviewId=' + encodeURIComponent(reviewId));
-        const current = await response.json();
-        if (current.status === 'REVIEW_STARTING') { setTimeout(poll, 500); return; }
-        render(status, { ok: true }, current);
-      } catch {
-        status.textContent = 'Unable to reach the test server. Review state is unknown.';
-      }
-    };
-    poll();
-    return;
-  }
-
-  if (result.status === 'BET_SUBMISSION_SENT') {
-    status.textContent = 'Sports submission is disabled until the required sportsbook and account checks are verified.';
-    return;
-  }
-
-  const slotAction = (result.actions || []).find((action) => action.type === 'play_slot');
-  const slotResult = slotAction && slotAction.result;
-  const slotProgress = slotResult && Number.isInteger(slotResult.completedSpins)
-    ? slotResult.stoppedBeforeAnySpin
-      ? '\\nSlot run stopped before any spin; 0 spins completed.'
-      : '\\nSlot run ' + (slotAction.success ? 'completed ' : 'stopped after ') +
-        slotResult.completedSpins + ' verified spin(s); ' + slotResult.attemptedSpins + ' spin(s) were attempted.'
-    : '';
-  status.textContent =
-    (result.status || (result.success ? 'PASS' : 'FAIL')) +
-    (result.reason ? '\\nReason: ' + result.reason : '') +
-    slotProgress +
-    (result.durationMs !== undefined
-      ? '\\nExecution time: ' + result.durationMs + ' ms'
-      : '') +
-    usageText +
-    '\\n' + JSON.stringify(result.actions ?? [], null, 2);
-}
-
-form.addEventListener('submit', async (event) => {
-  event.preventDefault();
-  const instruction = input.value.trim();
-  if (!instruction) return;
-
-  addMessage('user', instruction);
-  input.value = '';
-  send.disabled = true;
-  addMessage('agent', 'Running test...');
-
-  const status = messages.lastElementChild;
-
-  try {
-    const response = await fetch('/api/run', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ instruction })
-    });
-
-    let result;
-    try {
-      result = await response.json();
-    } catch {
-      throw new Error('The server returned an unreadable response (HTTP ' + response.status + ').');
-    }
-    render(status, response, result);
-  } catch (error) {
-    status.textContent = 'Request failed: ' + (error && error.message ? error.message : String(error));
-  } finally {
-    send.disabled = false;
-  }
-});
-
-fetch('/api/review-current').then(async (response) => {
-  if (!response.ok) return;
-  const current = await response.json();
-  if (current.status === 'REVIEW_STARTING' || current.status === 'REVIEW_READY') {
-    const status = addMessage('agent', '');
-    render(status, { ok: true }, current);
-  }
-}).catch(() => {});
-</script>
+<script src="/client.js" defer></script>
 </body>
 </html>`;
 
@@ -342,12 +191,15 @@ function runNode(args, env, timeoutMs) {
 }
 
 // Plans without touching the browser. Returns the PLAN_RESULT object.
-async function planInstruction(instruction) {
+async function planInstruction(instruction, pendingSports, conversationState, messageId) {
   const tsxCli = path.join(PROJECT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
   console.log('[Planner] Starting plan generation');
   const { stdout, stderr } = await runNode(
     [tsxCli, 'scripts/plan.ts'],
-    { AGENT_INSTRUCTION: instruction },
+    { AGENT_INSTRUCTION: instruction,
+      AGENT_PENDING_SPORTS_REQUEST: pendingSports ? JSON.stringify(pendingSports) : '',
+      AGENT_SPORTS_CONVERSATION_STATE: conversationState ? JSON.stringify(conversationState) : '',
+      AGENT_CONVERSATION_MESSAGE_ID: messageId },
     90000
   );
   console.log('[Planner] Plan generation process finished');
@@ -356,7 +208,12 @@ async function planInstruction(instruction) {
     console.error('Planner stderr:', stderr);
     throw new Error('PLANNING_FAILED');
   }
-  return JSON.parse(line.slice('PLAN_RESULT:'.length));
+  const result = JSON.parse(line.slice('PLAN_RESULT:'.length));
+  if (['MODEL_TIMEOUT', 'MODEL_UNAVAILABLE', 'INVALID_INTERPRETATION'].includes(result.code)) {
+    // Log only the classification and draft presence, not user messages or model output.
+    console.error('[Planner]', result.code, result.pendingSports ? '(draft preserved)' : '(no saved draft)');
+  }
+  return result;
 }
 
 function describePlan(plan) {
@@ -364,9 +221,13 @@ function describePlan(plan) {
   if (sportsBet) {
     const picks = sportsBet.selections.map((selection) => selection.team
       + (selection.opponent ? ' vs ' + selection.opponent : '')).join('; ');
-    return 'Prepare ' + (sportsBet.selections.length > 1 ? 'one accumulator' : 'one single bet')
-      + ' for ' + picks + ' at R' + (sportsBet.stakeCents / 100).toFixed(2)
-      + ' total. Final review acceptance would be separate authorization.';
+    return 'Selections: ' + picks + '\n'
+      + sportsBet.selections.map((selection, index) => 'Selection ' + (index + 1) + ': Team: ' + selection.team + '; Opponent: ' + selection.opponent).join('\n')
+      + '\nCompetition: ' + (sportsBet.competition === 'premier-league' ? 'Premier League' : sportsBet.competition)
+      + '\nMarket: ' + (sportsBet.market === 'match-winner' ? 'Match winner' : sportsBet.market)
+      + '\nBet type: ' + (sportsBet.selections.length > 1 ? 'Accumulator' : 'Single')
+      + '\nTotal stake: R' + (sportsBet.stakeCents / 100).toFixed(2)
+      + '\nConfirm and run authorizes preparation only. The agent cannot submit from messages or model output. After review, use the separate explicit Submit bet button in chat.';
   }
   const spin = plan.actions.find((a) => a.type === 'play_slot');
   if (!spin) return 'Open a casino game on the test account.';
@@ -406,27 +267,31 @@ async function executePlanFile(plan, testFile, extraEnv) {
   }
 }
 
-async function startReviewRun(plan, usage) {
+async function startReviewRun(plan, usage, sessionId, revision = 0) {
   const directory = await mkdtemp(path.join(os.tmpdir(), 'hwb-review-'));
   const planPath = path.join(directory, 'plan.json');
   const reportPath = path.join(directory, 'report.json');
   const reviewReadyPath = path.join(directory, 'review-ready.json');
   const reviewDecisionPath = path.join(directory, 'review-decision.json');
   const reviewStatePath = path.join(directory, 'review-state.json');
+  const submissionResultPath = path.join(directory, 'submission-result.json');
   const reviewStopPath = path.join(directory, 'review-stop');
   const runId = randomUUID();
-  const review = reviews.begin({ runId, timeoutMs: REVIEW_TIMEOUT_MS });
+  // Bind the revision before cloning the active review or launching the runner.
+  const review = { ...reviews.begin({ runId, timeoutMs: REVIEW_TIMEOUT_MS }), revision };
   await writeFile(planPath, JSON.stringify(plan), 'utf8');
-  activeReview = { ...review, directory, reportPath, reviewReadyPath, reviewDecisionPath, reviewStatePath, reviewStopPath, usage, plan };
-  busy = true;
+  activeReview = { ...review, directory, reportPath, reviewReadyPath, reviewDecisionPath, reviewStatePath, reviewStopPath, submissionResultPath, usage, plan, sessionId };
   executePlanFile(plan, SPORTS_TEST, {
     ALLOW_SPORTS_PREPARE: '1',
     AGENT_REVIEW_ID: review.id,
     AGENT_REVIEW_RUN_ID: runId,
+    AGENT_CHAT_SESSION_ID: sessionId,
+    AGENT_REVIEW_REVISION: String(review.revision ?? 0),
     AGENT_REVIEW_TIMEOUT_MS: String(REVIEW_TIMEOUT_MS),
     AGENT_REVIEW_READY_PATH: reviewReadyPath,
     AGENT_REVIEW_DECISION_PATH: reviewDecisionPath,
     AGENT_REVIEW_STATE_PATH: reviewStatePath,
+    AGENT_SUBMISSION_RESULT_PATH: submissionResultPath,
     AGENT_REVIEW_STOP_PATH: reviewStopPath,
     AGENT_PLAN_PATH: planPath,
     AGENT_REPORT_PATH: reportPath
@@ -437,15 +302,13 @@ async function startReviewRun(plan, usage) {
           : 'failed';
     reviews.complete(review.id, runId, state);
     activeReview.terminal = { code, report };
-    busy = false;
   }).catch((error) => {
     reviews.complete(review.id, runId, 'failed');
     activeReview.terminal = { error: error instanceof Error ? error.message : 'REVIEW_FAILED' };
-    busy = false;
   }).finally(async () => {
     await rm(directory, { recursive: true, force: true }).catch(() => undefined);
   });
-  return review;
+  return activeReview;
 }
 
 async function readReviewStatus(review) {
@@ -608,8 +471,8 @@ function errorResponse(res, error) {
   return sendJson(res, status, { success: false, code, error: userMessage });
 }
 
-function reportResponse(res, code, report, usage, extra = {}) {
-  return sendJson(res, 200, withUsage({
+function reportResponse(res, code, report, usage, extra = {}, respond = (data) => sendJson(res, 200, data)) {
+  return respond(withUsage({
     status: report.status ?? (code === 0 && report.success === true ? 'PASS' : 'FAIL'),
     success: code === 0 && report.success === true,
     reason: report.reason,
@@ -628,9 +491,41 @@ async function readJsonBody(req) {
   return JSON.parse(body);
 }
 
-const server = http.createServer(async (req, res) => {
+function createChatServer({ planMessage = planInstruction, prepareReview = startReviewRun, runPlan = executePlanFile,
+  inspectSlots = runMidsceneInspection,
+  getActiveReview = () => activeReview, reviewStatus = readReviewStatus,
+  reviewIsReady = (review) => reviews.get(review.id)?.state === 'ready',
+  reviewRunnerAvailable = (review) => Boolean(review.reviewDecisionPath && review.submissionResultPath && !review.terminal),
+  getSubmissionEnabled = () => process.env.ENABLE_SPORTS_SUBMISSION === '1',
+  // A real provider evidence adapter must be deliberately installed after its
+  // receipt/rejection markup and correlation rules have been verified.
+  verifySubmissionEvidence = () => false,
+  submitReview = submitThroughRunner } = {}) {
+const chatSessions = createChatSessions();
+const submissions = createSubmissionState();
+let busy = false;
+const isBusy = () => busy || Boolean(getActiveReview() && !getActiveReview().terminal);
+return http.createServer(async (req, res) => {
+  const { session, created, cookie } = chatSessions.resolve(req.headers.cookie || '');
+  if (created) res.setHeader('Set-Cookie', cookie);
   const startedAt = Date.now();
   const requestUrl = new URL(req.url || '/', 'http://127.0.0.1:3001');
+  let confirmationInvalidated = false;
+  const conversationView = () => {
+    const confirmations = [...session.confirmations].filter(([, item]) => item.expires > Date.now()
+      && (item.sportsRevision === undefined || (item.sportsRevision === session.conversationState?.revision
+        && sportsPlanMatchesRequest(item.plan, session.conversationState))))
+      .map(([planId, item]) => ({ planId, kind: item.sportsRevision === undefined ? 'slot' : 'sports',
+        revision: item.sportsRevision, expiresAt: item.expires }));
+    const review = getActiveReview();
+    return { phase: review && !review.terminal && review.sessionId === session.id ? review.phase || 'running'
+      : confirmations.length ? 'awaiting_confirmation' : session.pendingSports ? 'clarification' : 'idle',
+      revision: session.conversationState?.revision ?? null, confirmations, confirmationInvalidated };
+  };
+  const reply = (data) => {
+    rememberMessage(session, { id: randomUUID(), role: 'agent', result: data });
+    return sendJson(res, 200, { ...data, conversation: conversationView() });
+  };
   if (req.method === 'POST') {
     console.log('[Chat request] ' + req.method + ' ' + requestUrl.pathname + ' received');
     res.on('finish', () => {
@@ -644,17 +539,73 @@ const server = http.createServer(async (req, res) => {
       'Cache-Control': 'no-store',
       'X-Content-Type-Options': 'nosniff',
       'Content-Security-Policy':
-        "default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'"
+        "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'"
     });
     return res.end(html);
   }
 
   const route = requestUrl.pathname;
+  if (req.method === 'GET' && route === '/client.js') {
+    res.writeHead(200, { 'Content-Type': 'text/javascript; charset=utf-8', 'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff' });
+    return res.end(await readFile(path.join(__dirname, 'client.js'), 'utf8'));
+  }
+  if (req.method === 'GET' && route === '/api/conversation-state') {
+    return sendJson(res, 200, { conversation: conversationView(), messages: session.messages });
+  }
   if (req.method === 'GET' && (route === '/api/review-status' || route === '/api/review-current')) {
     const requestedId = route === '/api/review-current' ? undefined : requestUrl.searchParams.get('reviewId');
-    const review = reviews.get(requestedId);
-    if (!review || !activeReview || activeReview.id !== review.id) return sendJson(res, 404, { status: 'REVIEW_CLOSED', error: 'Review is unknown or has ended.' });
-    try { return sendJson(res, 200, await readReviewStatus(activeReview)); }
+    const review = getActiveReview();
+    if (!review || (requestedId && review.id !== requestedId) || review.sessionId !== session.id) return sendJson(res, 404, { status: 'REVIEW_CLOSED', error: 'Review is unknown or has ended.' });
+    const pendingAttempt = submissions.get();
+    if (pendingAttempt?.reviewId === review.id && pendingAttempt.state === 'unknown' && review.submissionResultPath) {
+      try {
+        const late = JSON.parse(await readFile(review.submissionResultPath, 'utf8'));
+        if (late.id === review.id && late.runId === review.runId && late.authorization === pendingAttempt.authorization
+          && ['accepted', 'rejected'].includes(late.outcome) && verifySubmissionEvidence(late, review)
+          && (late.outcome !== 'accepted' || (typeof late.betReference === 'string'
+            && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(late.betReference)))) {
+          const reconciled = submissions.reconcile({ reviewId: review.id, runId: review.runId,
+            authorization: pendingAttempt.authorization, outcome: late.outcome, betReference: late.betReference,
+            reason: typeof late.reason === 'string' ? late.reason : undefined });
+          if (reconciled) {
+            const response = late.outcome === 'accepted'
+              ? { status: 'BET_ACCEPTED', success: true, betReference: late.betReference,
+                stakeCents: review.submissionDetails?.stakeCents,
+                selections: (review.submissionDetails?.selections || []).map(({ fixture, selection }) => ({ fixture, selection })) }
+              : { status: 'BET_REJECTED', success: false, reason: reconciled.result.reason || 'The sportsbook explicitly rejected the bet.' };
+            const messageId = 'submission-' + review.id;
+            if (!replaceMessageResult(session, messageId, response)) rememberMessage(session, { id: messageId, role: 'agent', result: response });
+            return sendJson(res, 200, { ...response, reviewId: review.id, conversation: conversationView() });
+          }
+        }
+      } catch (error) { if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) {
+        return sendJson(res, 503, { status: 'BET_OUTCOME_UNKNOWN', reason: 'Submission attempted—acceptance unverified. Check My Bets before trying again.' });
+      } }
+    }
+    try {
+      const result = { ...withUsage(await reviewStatus(review), review.usage), reviewId: review.id,
+        revision: review.revision ?? 0, competition: review.plan?.actions?.[0]?.competition ?? null,
+        submissionEnabled: getSubmissionEnabled() && reviewIsReady(review) && reviewRunnerAvailable(review) };
+      result.submissionBlockReason = !reviewRunnerAvailable(review) ? 'The browser runner for this review is unavailable.'
+        : !getSubmissionEnabled() ? 'Submission transport is disabled. Configure ENABLE_SPORTS_SUBMISSION=1 for the isolated test account.'
+          : !reviewIsReady(review) ? 'This review is not in a valid ready state.' : null;
+      if (result.status === 'REVIEW_READY') {
+        review.phase = 'manual_review';
+        const betslip = result.actions?.[0]?.betslip;
+        const existing = submissions.get();
+        if (betslip && (!existing || existing.reviewId !== review.id)) {
+          const authorization = submissions.begin({ reviewId: review.id, runId: review.runId,
+            sessionId: review.sessionId, revision: review.revision ?? 0, betslip,
+            reviewedDetails: { competition: result.competition, betslip },
+            expiresAt: result.expiresAt ?? review.expiresAt });
+          if (authorization) result.idempotencyKey = authorization.idempotencyKey;
+        } else if (existing?.reviewId === review.id) result.idempotencyKey = existing.idempotencyKey;
+      }
+      if (result.status !== 'REVIEW_STARTING') rememberMessage(session, {
+        id: 'review-' + review.id + '-' + result.status, role: 'agent', result,
+      });
+      return sendJson(res, 200, { ...result, conversation: conversationView() });
+    }
     catch { return sendJson(res, 500, { status: 'REVIEW_CLOSED', error: 'Unable to read review state.' }); }
   }
 
@@ -663,21 +614,106 @@ const server = http.createServer(async (req, res) => {
     let payload;
     try { payload = await readJsonBody(req); }
     catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
-    if (!activeReview || typeof payload.reviewId !== 'string') return sendJson(res, 404, { error: 'Review is unknown or has ended.' });
+    if (!activeReview || activeReview.sessionId !== session.id || typeof payload.reviewId !== 'string') return sendJson(res, 404, { error: 'Review is unknown or has ended.' });
+    if (activeReview.submissionInProgress) return sendJson(res, 409, { error: 'Submission is being processed; review cannot be finished yet.' });
     const result = reviews.finish(payload.reviewId, activeReview.runId);
     if (!result.ok) return sendJson(res, result.reason === 'expired' ? 410 : 404, { error: result.reason === 'expired' ? 'Review expired — no bet submitted.' : 'Review is unknown, mismatched, or not ready.' });
     if (!result.repeated) {
       try {
-        await writeFile(activeReview.reviewDecisionPath, JSON.stringify({ id: activeReview.id, runId: activeReview.runId }), 'utf8');
+        await writeFile(activeReview.reviewDecisionPath, JSON.stringify({ id: activeReview.id, runId: activeReview.runId, decision: 'finish' }), 'utf8');
       } catch {
         reviews.complete(activeReview.id, activeReview.runId, 'ready');
         return sendJson(res, 500, { error: 'Review could not be released. The browser session remains open.' });
       }
     }
-    return sendJson(res, 200, { success: true, repeated: result.repeated, message: 'Review finished — no bet submitted.' });
+    const ended = withUsage({ status: 'REVIEW_CLOSED', reviewId: activeReview.id,
+      success: true, repeated: result.repeated, message: 'Review finished — no bet submitted.',
+      reason: 'Review finished. The agent did not submit the bet.' }, activeReview.usage);
+    rememberMessage(session, { id: 'review-' + activeReview.id + '-finished', role: 'agent', result: ended });
+    return sendJson(res, 200, { ...ended, conversation: conversationView() });
   }
 
-  if (req.method !== 'POST' || !['/api/run', '/api/confirm'].includes(route)) {
+  if (req.method === 'POST' && route === '/api/submit-review') {
+    if (req.headers.origin !== 'http://' + HOST + ':' + PORT) return sendJson(res, 403, { error: 'Invalid request origin' });
+    let payload;
+    try { payload = await readJsonBody(req); } catch { return sendJson(res, 400, { error: 'Invalid JSON' }); }
+    const review = getActiveReview();
+    if (!review || review.sessionId !== session.id || payload.reviewId !== review.id
+      || !Number.isSafeInteger(payload.revision) || !/^[a-zA-Z0-9-]{1,100}$/.test(payload.idempotencyKey || '')) {
+      return sendJson(res, 404, { error: 'Review is unknown, mismatched, or not ready.' });
+    }
+    if (!reviewRunnerAvailable(review)) return sendJson(res, 503, { status: 'SUBMISSION_BLOCKED', success: false,
+      reason: 'The browser runner for this review is unavailable.' });
+    if (!getSubmissionEnabled()) return sendJson(res, 503, { status: 'SUBMISSION_BLOCKED', success: false,
+      reason: 'Submission transport is disabled. Configure ENABLE_SPORTS_SUBMISSION=1 for the isolated test account.' });
+    let snapshot;
+    try { snapshot = await reviewStatus(review); } catch { return sendJson(res, 503, { status: 'SUBMISSION_UNKNOWN', error: 'Review details could not be verified. Check the sportsbook before trying again.' }); }
+    if (snapshot.status !== 'REVIEW_READY' || !reviewIsReady(review)
+      || payload.revision !== review.revision) return sendJson(res, 409, { error: 'Review is stale, closed, or expired.' });
+    const expiresAt = snapshot.expiresAt ?? review.expiresAt;
+    if (expiresAt <= Date.now()) return sendJson(res, 410, { error: 'Review expired. No new attempt was started.' });
+    if (!preparationReviewPayload({ status: 'BETSLIP_READY', success: true, actions: snapshot.actions }, review.id, expiresAt)) {
+      return sendJson(res, 409, { status: 'REVIEW_UNVERIFIED', error: 'The reviewed slip contains unreadable or invalid material fields. No submission was started.' });
+    }
+    const betslip = snapshot.actions?.[0]?.betslip;
+    if (betslip.betType === 'accumulator' && (betslip.oddsBasis !== 'sportsbook-displayed'
+      || !Number.isFinite(betslip.baseOdds) || betslip.bonusStatus !== 'verified'
+      || !Number.isFinite(betslip.observedBonusPercent) || !Number.isFinite(betslip.finalOdds)
+      || betslip.displayedPayoutBasis !== 'stake-inclusive')) {
+      return sendJson(res, 409, { status: 'REVIEW_UNVERIFIED', error: 'Accumulator base odds, applied bonus, final odds and payout basis are not all sportsbook-verified. No submission was started.' });
+    }
+    const reviewedDetails = { competition: snapshot.competition ?? review.plan?.actions?.[0]?.competition ?? null, betslip };
+    const prior = submissions.get();
+    if (prior?.reviewId === review.id && prior.state === 'ready'
+      && prior.fingerprint !== fingerprint(reviewedDetails)) {
+      const refreshed = submissions.refresh({ reviewId: review.id, runId: review.runId, sessionId: session.id,
+        revision: review.revision, betslip, reviewedDetails, expiresAt: snapshot.expiresAt ?? review.expiresAt });
+      if (refreshed) return sendJson(res, 200, { ...snapshot, status: 'REVIEW_READY', reviewId: review.id,
+        revision: review.revision, competition: review.plan?.actions?.[0]?.competition ?? null,
+        idempotencyKey: refreshed.idempotencyKey, refreshed: true });
+    }
+    const claim = submissions.claim({ reviewId: review.id, runId: review.runId, sessionId: session.id,
+      revision: review.revision, fingerprint: fingerprint(reviewedDetails), idempotencyKey: payload.idempotencyKey });
+    if (!claim.ok) return sendJson(res, claim.reason === 'expired' ? 410 : 409, { error: claim.reason === 'expired' ? 'Review expired.' : 'Submission was already attempted or authorization is invalid.' });
+    review.submissionInProgress = true;
+    review.submissionDetails = betslip;
+    if (submissions.transition('submitting')) {
+      // The production browser boundary remains disabled until verified final controls and
+      // an acceptance receipt are established. Tests inject a fully mocked boundary.
+      let result;
+      try { result = await submitReview({ review, betslip, authorization: claim.authorization,
+        idempotencyKey: claim.idempotencyKey, requestedIdempotencyKey: payload.idempotencyKey,
+        sessionId: review.sessionId, revision: review.revision, expiresAt, reviewedDetails }); }
+      catch { result = { outcome: 'unknown' }; }
+      if (['accepted', 'rejected'].includes(result?.outcome) && !verifySubmissionEvidence(result, review)) {
+        result = { outcome: 'unknown', reason: 'Submission attempted—acceptance unverified. Check My Bets before trying again.' };
+      }
+      if (result?.outcome === 'accepted' && !(typeof result.betReference === 'string'
+        && /^[A-Za-z0-9][A-Za-z0-9._/-]{0,99}$/.test(result.betReference))) {
+        result = { outcome: 'unknown', reason: 'Submission attempted—acceptance unverified. Check My Bets before trying again.' };
+      }
+      const state = ['blocked', 'changed'].includes(result?.outcome) ? 'closed'
+        : ['accepted', 'rejected', 'unknown', 'closed'].includes(result?.outcome) ? result.outcome : 'unknown';
+      submissions.transition(state);
+      review.submissionInProgress = false;
+      if (result?.outcome !== 'blocked' && review.reviewDecisionPath) {
+        await writeFile(review.reviewDecisionPath, JSON.stringify({ id: review.id, runId: review.runId,
+          decision: 'submission_complete', authorization: claim.authorization }), 'utf8').catch(() => undefined);
+      }
+      const response = state === 'accepted' ? { status: 'BET_ACCEPTED', success: true, betReference: result.betReference,
+        stakeCents: betslip.stakeCents,
+        selections: betslip.selections.map(({ fixture, selection }) => ({ fixture, selection })) }
+        : state === 'rejected' ? { status: 'BET_REJECTED', success: false, reason: result.reason || 'The sportsbook explicitly rejected the bet.' }
+        : ['blocked', 'changed'].includes(result?.outcome) ? { status: 'SUBMISSION_BLOCKED', success: false, reason: result.reason || 'Submission is unavailable.' }
+        : state === 'unknown' ? { status: 'BET_OUTCOME_UNKNOWN', success: false, reason: result?.reason || 'Submission attempted—acceptance unverified. Check My Bets before trying again.' }
+            : { status: 'SUBMISSION_BLOCKED', success: false, reason: result?.reason || 'Submission is unavailable.' };
+      rememberMessage(session, { id: 'submission-' + review.id, role: 'agent', result: response });
+      return sendJson(res, state === 'accepted' || state === 'rejected' ? 200 : 503, response);
+    }
+    return sendJson(res, 409, { error: 'Submission authorization was already consumed.' });
+  }
+
+  if (req.method !== 'POST' || !['/api/run', '/api/confirm', '/api/cancel'].includes(route)) {
     return sendJson(res, 404, { error: 'Not found' });
   }
 
@@ -686,8 +722,8 @@ const server = http.createServer(async (req, res) => {
     return sendJson(res, 403, { error: 'Invalid request origin' });
   }
 
-  if (busyRejects(route, busy)) {
-    return sendJson(res, 409, { error: 'Another test is running' });
+  if (busyRejects(route, isBusy())) {
+    return sendJson(res, 409, { code: 'BUSY', error: 'Another test is running' });
   }
 
   let payload;
@@ -699,15 +735,39 @@ const server = http.createServer(async (req, res) => {
       : sendJson(res, 400, { error: 'Invalid JSON' });
   }
 
+  if (route === '/api/run') {
+    // Legacy API clients without a mode retain the historical SPORTS flow.
+    // Slot work always requires an explicit mode; there is no implicit play permission.
+    const mode = payload.mode === undefined ? 'SPORTS' : payload.mode;
+    if (!EXECUTION_MODES.includes(mode)) return sendJson(res, 400, { status: 'INVALID_MODE', code: 'INVALID_MODE', error: 'Select SPORTS or SLOTS_INSPECT.' });
+    if (mode === 'SLOTS_PLAY') return sendJson(res, 403, { status: 'MODE_DISABLED', code: 'MODE_DISABLED', success: false, error: 'SLOTS_PLAY is disabled.' });
+    if (typeof payload.instruction !== 'string' || !payload.instruction.trim() || payload.instruction.length > 500)
+      return sendJson(res, 400, { status: 'INVALID_REQUEST', code: 'INVALID_REQUEST', error: 'Invalid instruction' });
+    if (mode === 'SLOTS_INSPECT') {
+      if (/\b(spin|spins|wager|bet|place|play)\b/i.test(payload.instruction))
+        return sendJson(res, 403, { status: 'ACTION_NOT_PERMITTED', code: 'ACTION_NOT_PERMITTED', success: false, error: 'SLOTS_INSPECT allows read-only inspection only.' });
+      if (inspectionBusy) return sendJson(res, 409, { status: 'BUSY', code: 'BUSY', error: 'Another browser inspection is running.' });
+      inspectionBusy = true;
+      try { return reply(await inspectSlots(payload.instruction)); }
+      catch (error) { return reply({ status: 'MIDSCENE_INSPECTION_FAILED', success: false, mode, error: 'MIDSCENE_INSPECTION_FAILED', logs: String(error).slice(0, 2000) }); }
+      finally { inspectionBusy = false; }
+    }
+  }
+
+  // Body reads yield to other requests. Recheck before taking the execution lock.
+  if (busyRejects(route, isBusy())) return sendJson(res, 409, { code: 'BUSY', error: 'Another test is running' });
   busy = true;
   try {
+    if (route === '/api/cancel') {
+      if (!cancelConfirmation(session, payload.planId)) return sendJson(res, 400, { code: 'PLAN_EXPIRED', error: 'Plan expired or unknown.' });
+      confirmationInvalidated = true;
+      return reply({ status: 'CANCELLED', reason: 'Cancelled. Nothing was run.', actions: [] });
+    }
     // ---- Step 2: user confirmed a wager plan ----
     if (route === '/api/confirm') {
-      const pending = pendingPlans.get(payload.planId);
-      pendingPlans.delete(payload.planId);
-
-      if (!pending || pending.expires < Date.now()) {
-        return sendJson(res, 400, { code: 'PLAN_EXPIRED', error: 'Plan expired or unknown. Send the request again.' });
+      const pending = takeConfirmation(session, payload.planId);
+      if (!pending) {
+        return sendJson(res, 400, { code: 'PLAN_EXPIRED', error: 'Plan expired, already used, or unknown. Start with “New request: …” for a fresh summary.' });
       }
 
       const isSports = pending.plan.actions.some((action) => action.type === 'prepare_sports_bet');
@@ -720,13 +780,18 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (sportsAction && sportsAction.submit === false) {
-        const review = await startReviewRun(pending.plan, pending.usage);
-        return sendJson(res, 200, { status: 'REVIEW_STARTING', reviewId: review.id });
+        const review = await prepareReview(pending.plan, pending.usage, session.id, pending.sportsRevision ?? 0);
+        review.revision = pending.sportsRevision ?? 0;
+        session.pendingSports = null;
+        session.conversationState = null;
+        clearSportsConfirmations(session);
+        confirmationInvalidated = true;
+        return reply(withUsage({ status: 'REVIEW_STARTING', reviewId: review.id }, pending.usage));
       }
       const testFile = isSports ? SPORTS_TEST : SLOT_TEST;
       const env = isSports ? { ALLOW_SPORTS_PREPARE: '1' } : { ALLOW_SPINS: '1' };
-      const { code, report } = await executePlanFile(pending.plan, testFile, env);
-      return reportResponse(res, code, report, pending.usage);
+      const { code, report } = await runPlan(pending.plan, testFile, env);
+      return reportResponse(res, code, report, pending.usage, {}, reply);
     }
 
     // ---- Step 1: plan the instruction ----
@@ -735,11 +800,21 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 400, { error: 'Invalid instruction' });
     }
 
-    if (!/^(inspect|verify|check|report|navigate|open|play|spin|prepare|place|bet|choose|select|log\s?in)\b/i.test(instruction.trim())) {
-      return sendJson(res, 400, { error: 'Only approved testing requests are supported' });
+    if (payload.messageId !== undefined && (typeof payload.messageId !== 'string' || !/^[a-zA-Z0-9-]{1,100}$/.test(payload.messageId))) {
+      return sendJson(res, 400, { error: 'Invalid message ID' });
     }
-
-    const result = await planInstruction(instruction);
+    const messageId = payload.messageId || randomUUID();
+    rememberMessage(session, { id: 'user-' + messageId, role: 'user', text: instruction });
+    const result = await planMessage(instruction, session.pendingSports, session.conversationState, messageId);
+    if (Object.hasOwn(result, 'pendingSports')) {
+      confirmationInvalidated = Boolean(result.confirmationInvalidated ?? result.changed);
+      if (confirmationInvalidated) clearSportsConfirmations(session);
+      session.pendingSports = result.pendingSports;
+      if (result.conversationState) session.conversationState = result.conversationState;
+    }
+    if (['CLARIFICATION', 'AMBIGUOUS', 'UNRELATED', 'CANCELLED', 'EXPIRED', 'UNCHANGED'].includes(result.status)) {
+      return reply(withUsage({ status: result.status, reason: result.reason, requirements: result.requirements || [], actions: [] }, result.usage));
+    }
 
     if (result.status === 'BLOCKED') {
       const slotRequest = /\b(slot|slots|spin|spins|casino|games in olympus)\b/i.test(instruction);
@@ -752,57 +827,59 @@ const server = http.createServer(async (req, res) => {
             ? result.reason
             : `${result.reason} No browser run was started.`
         : result.reason;
-      return sendJson(res, 200, {
+      return reply(withUsage({
         status: 'BLOCKED', success: false,
         reason: slotRequest ? result.reason + ' ' + supported : sportsRequest
           ? sportsReason
           : result.reason,
         actions: []
-      });
+      }, result.usage));
     }
     if (result.status !== 'PLANNED') {
       throw new Error(result.code || 'PLANNING_FAILED');
     }
 
     const sportsAction = result.plan.actions.find((action) => action.type === 'prepare_sports_bet');
-    if (sportsAction) {
-      const stake = extractExplicitStakeCents(instruction);
-      if (!stake.ok) return sendJson(res, 200, {
+    if (sportsAction && (result.auth !== true || !result.pendingSports || !sportsPlanMatchesRequest(result.plan, result.conversationState)
+      || sportsRequestFingerprint(result.pendingSports) !== sportsRequestFingerprint(result.conversationState.request)
+      || result.conversationState.confirmation.expiresAt <= Date.now())) {
+      return reply(withUsage({
         status: 'BLOCKED', success: false,
-        reason: stake.reason === 'SPORTS_STAKE_OVER_R50'
-          ? 'The requested total stake exceeds R50. No browser run was started.'
-          : stake.reason === 'SPORTS_STAKE_BELOW_MINIMUM'
-            ? 'The minimum total stake is R1.00. No browser run was started.'
-            : 'Provide exactly one valid total stake in ZAR from R1.00 through R50.00, such as R10.01. No browser run was started.',
+        reason: 'The sports plan did not come from a complete conversation request. Please describe the preparation request again. No browser run was started.',
         actions: []
-      });
-      if (stake.stakeCents !== sportsAction.stakeCents) return sendJson(res, 200, {
-        status: 'BLOCKED', success: false,
-        reason: 'The planned stake did not match the exact requested amount. No browser run was started.', actions: []
-      });
+      }, result.usage));
     }
 
     // Anything that needs the account waits for an explicit confirmation.
     if (result.auth) {
       const planId = randomUUID();
-      pendingPlans.set(planId, pendingPlan(result.plan, result.usage, Date.now() + CONFIRM_WINDOW_MS));
-      return sendJson(res, 200, withUsage({
+      session.confirmations.set(planId, {
+        ...pendingPlan(result.plan, result.usage, result.conversationState?.confirmation?.expiresAt ?? Date.now() + CONFIRM_WINDOW_MS),
+        ...(sportsAction && result.conversationState ? { sportsRevision: result.conversationState.revision,
+          sportsRequestFingerprint: sportsRequestFingerprint(result.pendingSports) } : {}),
+      });
+      return reply(withUsage({
         status: 'CONFIRM',
         planId,
         summary: describePlan(result.plan),
-        actions: result.plan.actions
+        actions: result.plan.actions,
+        revision: sportsAction ? result.conversationState.revision : undefined,
+        expiresAt: session.confirmations.get(planId).expires,
       }, result.usage));
     }
 
-    const { code, report } = await executePlanFile(result.plan, READ_ONLY_TEST, {});
-    return reportResponse(res, code, report, result.usage);
+    const { code, report } = await runPlan(result.plan, READ_ONLY_TEST, {});
+    return reportResponse(res, code, report, result.usage, {}, reply);
   } catch (error) {
     return errorResponse(res, error);
   } finally {
-    busy = Boolean(activeReview && !activeReview.terminal);
+    busy = false;
   }
 });
+}
 
+if (require.main === module) {
+const server = createChatServer();
 server.listen(PORT, HOST, () => {
   console.log('AI Testing Agent: http://' + HOST + ':' + PORT);
 });
@@ -815,3 +892,6 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
     server.close();
   });
 }
+}
+
+module.exports = { createChatServer };

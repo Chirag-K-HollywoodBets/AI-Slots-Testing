@@ -8,7 +8,8 @@ vi.mock('e2e', () => ({ expect: (locator: { count(): Promise<number> }) => ({
   toHaveCount: async (count: number) => expect(await locator.count()).toBe(count),
 }) }));
 
-function harness({ payout = 'R31.50', failSecond = false, unreadableAfterClick = false, single = false, failBetType = false,
+function harness({ payout = 'R110.70', failSecond = false, unreadableAfterClick = false, single = false, failBetType = false,
+  legOdds = [3.00, 1.95],
   initialRows = [] as SlipSelection[] } = {}) {
   const fixtures = ['Arsenal vs Chelsea', 'Liverpool vs Everton'];
   const picks = ['Arsenal', 'Liverpool'];
@@ -17,7 +18,7 @@ function harness({ payout = 'R31.50', failSecond = false, unreadableAfterClick =
   let stake = '';
   const option = (index: number) => ({
     count: async () => 1,
-    allTextContents: async () => [`${picks[index]} ${single ? '0.65' : '0.75'}`],
+    allTextContents: async () => [`${picks[index]} ${single ? '0.65' : legOdds[index]}`],
     nth: () => ({ click: async () => {
       clicks.push(picks[index]);
       if (index === 1 && failSecond) throw new Error('click timed out');
@@ -81,11 +82,12 @@ describe('sports adapter contract', () => {
       preparation: { failedStage: 'SPORTS_BET_TYPE', addedSelections: [{ selection: 'Arsenal' }, { selection: 'Liverpool' }] } });
   });
 
-  it('reports base odds separately from the displayed payout and unverified bonus', async () => {
+  it('uses the fractional accumulator formula and does not infer bonus, payout basis or profit', async () => {
     const { prepare } = harness();
-    expect(await prepare()).toMatchObject({ status: 'BETSLIP_READY', oddsBasis: 'decimal',
-      combinedOdds: 3.0625, displayedPayoutCents: 3150,
-      payoutEffectiveDecimalOdds: 3.15, payoutAdjustmentCents: 87, bonusStatus: 'unverified' });
+    expect(await prepare()).toMatchObject({ status: 'BETSLIP_READY', oddsBasis: 'fractional-accumulator-calculation',
+      baseOdds: 10.8, combinedOdds: 10.8, displayedPayoutCents: 11070,
+      finalOdds: null, observedBonusPercent: null, payoutAdjustmentCents: null,
+      displayedPayoutBasis: 'unverified', potentialPayoutCents: null, potentialProfitCents: null, bonusStatus: 'unverified' });
   });
 
   it('reports the first added leg when the next click fails', async () => {

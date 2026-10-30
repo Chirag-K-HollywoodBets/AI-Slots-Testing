@@ -9,7 +9,8 @@
     "typecheck": "tsc --noEmit",
     "test:e2e": "e2e run",
     "test:agent": "vitest run tests/agent",
-    "midscene:inspect-slots": "tsx scripts/midscene/inspect-olympus.ts"
+    "midscene:inspect-slots": "tsx scripts/midscene/inspect-olympus.ts",
+    "midscene:check-model": "tsx scripts/midscene/inspect-olympus.ts --check-model"
   },
   "keywords": [],
   "author": "",
