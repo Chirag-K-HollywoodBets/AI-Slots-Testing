@@ -1,6 +1,9 @@
 
 import { z } from 'zod';
 import { validateSportsStakeCents } from './sports-fixtures';
+import { MAX_SPINS } from './slot-safety';
+
+export { MAX_SPINS } from './slot-safety';
 
 /**
  * Verified HollywoodBets routes.
@@ -67,7 +70,6 @@ export const GAME_IDS = Object.keys(ALLOWED_GAMES) as [
 
 /** Hard limits for wagering actions. The planner cannot exceed these. */
 export const ALLOWED_STAKES = [0.2] as const;
-export const MAX_SPINS = 100;
 
 /** Limits supplied by the project owner: R1.00 minimum, one-cent steps, R50 cap. */
 export const SPORTS_STAKE_LIMITS = { minCents: 100, maxCents: 5_000, incrementCents: 1 } as const;

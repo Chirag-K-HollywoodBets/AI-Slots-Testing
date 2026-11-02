@@ -25,6 +25,8 @@ import {
   validateSportsStakeCents,
 } from '../sports-fixtures';
 import { SPORTS_MAX_ACCUMULATOR_SELECTIONS, SPORTS_STAKE_LIMITS } from '../schema';
+import { guardSlotAction } from '../slot-safety';
+import { getSlotGameUrl, navigateToSlotGameUrl } from '../slot-navigation';
  
 // ---- Slot settings ----
  
@@ -330,8 +332,7 @@ export function createE2EBrowserAdapter(
     },
  
     async openGame(game: string) {
-      const path = (ALLOWED_GAMES as Record<string, string>)[game];
-      if (!path) throw new Error('GAME_NOT_ALLOWED');
+      const gameUrl = getSlotGameUrl(game, origin);
 
       // Install the doSpin guard before loading the game. It blocks every spin
       // throughout setup and only permits the exact, armed plan stake later.
@@ -368,18 +369,9 @@ export function createE2EBrowserAdapter(
  
       // browser.goto keeps the #/g/... part of the route; app.open does not.
       // One retry after a pause, in case the page was still navigating.
-      const gameUrl = new URL(path, origin).href;
-      let navigated = false;
-      for (let attempt = 1; attempt <= 2 && !navigated; attempt++) {
-        try {
-          await browser.goto(gameUrl);
-          navigated = true;
-        } catch {
-          console.log(`GAME NAVIGATION attempt ${attempt} failed`);
-          if (attempt < 2) await new Promise((r) => setTimeout(r, 3000));
-        }
-      }
-      if (!navigated) {
+      try {
+        await navigateToSlotGameUrl(gameUrl, (url) => browser.goto(url));
+      } catch {
         await initBody; // settle the pending wait before failing
         throw new Error('GAME_NAVIGATION_FAILED');
       }
@@ -413,6 +405,8 @@ export function createE2EBrowserAdapter(
  
     async playSlot(game: string, spins: number, stake: number) {
       // Re-check limits here too: the adapter must never trust its caller.
+      guardSlotAction({ type: 'spin', spins });
+      guardSlotAction({ type: 'wager', wager: stake });
       if (!(game in ALLOWED_GAMES)) throw new SlotRunError('GAME_NOT_ALLOWED', 0, 0);
       if (!Number.isInteger(spins) || spins < 1 || spins > MAX_SPINS) {
         throw new SlotRunError('SPIN_COUNT_NOT_ALLOWED', 0, 0);
@@ -455,6 +449,8 @@ export function createE2EBrowserAdapter(
         let previousBalance = gameState.balance;
  
         for (let i = 0; i < spins; i++) {
+          // Check the cumulative spin count immediately before each spin attempt.
+          guardSlotAction({ type: 'spin', spins: i + 1 });
           let responses: GameResponse[] | null = null;
  
           // Up to 3 tries per spin, but only while the guard has seen NO spin

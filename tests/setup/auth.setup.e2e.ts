@@ -4,25 +4,25 @@
  
 import { test } from '@e2e-dev/web';
 import { expect, credentials } from 'e2e';
+import { loginTestAccount } from '../../src/agent/test-account-login';
  
 test.setup('sign in to the HollywoodBets test account', { sessions: ['hb-test'] }, async ({ app, browser, screen, session }) => {
   const user = credentials.user('hb-test');
  
-  await app.open('/');
-  await screen.getByRole('button', /log in/i).tap();
- 
-  // Sign-in site (id.hollywoodbets.net). Selectors from tests/diagnostics/login-form.e2e.ts.
-  await expect(browser.locator('#Username')).toBeVisible({ timeout: 20000 });
-  await browser.locator('#Username').fill(user.username);
-  await browser.locator('#password').fill(user.password); // Secret handle, never the raw value
-  await browser.locator('#btnLogin').click();
- 
-  // Signed in = sent back to the main site, and the Log in button is gone.
-  await browser.waitForURL(/^https:\/\/www\.hollywoodbets\.net\//, { timeout: 30000 });
-  await expect(screen.getByRole('button', /log in/i)).not.toBeVisible({ timeout: 20000 });
-  // Only signed-in users have a balance in the header.
-  await expect(browser.locator('.account .balance-value').first()).toBeVisible({ timeout: 20000 });
-  await expect(browser.locator('.account .balance-value').first()).toContainText(/R\s?[\d\s]+,\d{2}/);
+  await loginTestAccount({
+    openHome: () => app.open('/'),
+    clickLogin: () => screen.getByRole('button', /log in/i).tap(),
+    waitForUsername: () => expect(browser.locator('#Username')).toBeVisible({ timeout: 20000 }),
+    fillUsername: (username) => browser.locator('#Username').fill(username),
+    fillPassword: (password) => browser.locator('#password').fill(password), // Secret handle, never the raw value
+    submit: () => browser.locator('#btnLogin').click(),
+    waitForSignedInUrl: () => browser.waitForURL(/^https:\/\/www\.hollywoodbets\.net\//, { timeout: 30000 }),
+    verifySignedIn: async () => {
+      await expect(screen.getByRole('button', /log in/i)).not.toBeVisible({ timeout: 20000 });
+      await expect(browser.locator('.account .balance-value').first()).toBeVisible({ timeout: 20000 });
+      await expect(browser.locator('.account .balance-value').first()).toContainText(/R\s?[\d\s]+,\d{2}/);
+    },
+  }, user);
  
   await session.save('hb-test');
 });

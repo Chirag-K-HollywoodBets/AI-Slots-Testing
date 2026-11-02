@@ -4,6 +4,7 @@ import {
   PlanSchema,
   type AgentAction,
 } from './schema';
+import { guardSlotAction } from './slot-safety';
 
 export interface SpinResult {
   stake: number;
@@ -125,6 +126,8 @@ export async function executePlan(
           break;
 
         case 'play_slot': {
+          guardSlotAction({ type: 'wager', wager: action.stake });
+          guardSlotAction({ type: 'spin', spins: action.spins });
           const spins = await browser.playSlot(
             action.game,
             action.spins,
