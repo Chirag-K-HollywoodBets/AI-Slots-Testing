@@ -5,6 +5,11 @@ import { resolve } from 'node:path';
 import { loginTestAccount } from '../../src/agent/test-account-login';
 import { navigateToSlotGame } from '../../src/agent/slot-navigation';
 import { guardSlotAction, MAX_WAGER } from '../../src/agent/slot-safety';
+import {
+  assessSettlementRead,
+  normalizeSlotReadout,
+  type SlotReadout,
+} from '../../src/agent/slot-settlement';
 
 const SITE_ORIGIN = 'https://www.hollywoodbets.net';
 const GAME_ID = 'games-in-olympus';
@@ -15,12 +20,6 @@ const MIDSCENE_POLL_INTERVAL_MS = 4_000;
 const SCOUT_MAX_SPINS = 20;
 const BALANCE_SETTLEMENT_TIMEOUT_MS = 20_000;
 const BALANCE_SETTLEMENT_POLL_MS = 2_000;
-
-interface SlotReadout {
-  bet: number;
-  balance: number;
-  win: number;
-}
 
 interface UnexpectedStates {
   freeSpinsPopup: boolean;
@@ -92,15 +91,8 @@ async function readSlotValues(agent: PlaywrightPageAgent): Promise<SlotReadout> 
     '{ bet: number, balance: number, win: number }, read the current bet per spin, account balance, ' +
     'and the win amount shown for the most recently completed spin. Return numeric amounts in South African rand, ' +
     'without currency symbols or text. If no win amount is shown, return win: 0.'
-  ) as SlotReadout;
-
-  if (!values || typeof values !== 'object'
-    || typeof values.bet !== 'number' || !Number.isFinite(values.bet)
-    || typeof values.balance !== 'number' || !Number.isFinite(values.balance)
-    || typeof values.win !== 'number' || !Number.isFinite(values.win) || values.win < 0) {
-    throw new Error('Midscene did not return numeric bet, balance, and win values.');
-  }
-  return values;
+  ) as unknown;
+  return normalizeSlotReadout(values);
 }
 
 async function waitForSettledSlotValues(
@@ -121,22 +113,17 @@ async function waitForSettledSlotValues(
       // One aiQuery reads all three values from the same visual observation.
       const current = await readSlotValues(agent);
       lastRead = current;
-      lastExpectedBalance = Math.round((balanceBefore - bet + current.win) * 100) / 100;
-      const delta = Math.abs(current.balance - lastExpectedBalance);
-      const tolerance = 0.01 + Number.EPSILON * 4 * Math.max(1, current.balance, lastExpectedBalance);
-      const reconciled = delta <= tolerance;
-      const stable = previous !== undefined
-        && Math.round(previous.balance * 100) === Math.round(current.balance * 100)
-        && Math.round(previous.win * 100) === Math.round(current.win * 100);
+      const assessment = assessSettlementRead(current, previous, balanceBefore, bet);
+      lastExpectedBalance = assessment.expectedBalance;
 
       console.log(
         `[spin ${spin}] settlement read ${readNumber}: bet=R${current.bet.toFixed(2)}, ` +
         `balance=R${current.balance.toFixed(2)}, win=R${current.win.toFixed(2)}, ` +
-        `expected=R${lastExpectedBalance.toFixed(2)}, delta=R${delta.toFixed(2)}, ` +
-        `reconciled=${reconciled}, stable=${stable}`,
+        `expected=R${lastExpectedBalance.toFixed(2)}, delta=R${assessment.difference.toFixed(2)}, ` +
+        `reconciled=${assessment.reconciled}, stable=${assessment.stable}`,
       );
 
-      if (reconciled && stable && Date.now() <= deadline) return current;
+      if (assessment.ready && Date.now() <= deadline) return current;
       previous = current;
     } catch (error) {
       // A failed or malformed observation breaks the consecutive-read pair.
