@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   assessSettlementRead,
+  decideSettlementPoll,
   normalizeSlotReadout,
   type SlotReadout,
 } from '../../src/agent/slot-settlement';
@@ -47,5 +48,28 @@ describe('slot balance settlement', () => {
     expect(assessments[1]?.reconciled).toBe(true);
     expect(assessments[1]?.stable).toBe(false);
     expect(assessments[2]?.ready).toBe(true);
+  });
+
+  it('accepts the spin 17 fourth read even when it completes after the deadline', () => {
+    const reads: unknown[] = [
+      { balance: 1018.24, win: 0.08, bet: 0.2 },
+      { balance: 1018.24, win: 0.34, bet: 0.2 },
+      { balance: 1018.63, win: 0.39, bet: 0.2 },
+      { balance: 1018.63, win: 0.39, bet: 0.2 },
+    ];
+    const completionTimes = [5_500, 11_000, 16_500, 22_000];
+    const deadline = 20_000;
+    let previous: SlotReadout | undefined;
+    let decision: string | undefined;
+
+    reads.forEach((raw, index) => {
+      const current = normalizeSlotReadout(raw);
+      const assessment = assessSettlementRead(current, previous, 1018.44, 0.2);
+      decision = decideSettlementPoll(assessment, completionTimes[index]!, deadline);
+      previous = current;
+    });
+
+    expect(completionTimes[3]).toBeGreaterThan(deadline);
+    expect(decision).toBe('settled');
   });
 });

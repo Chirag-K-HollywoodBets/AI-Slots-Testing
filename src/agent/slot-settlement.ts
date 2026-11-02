@@ -43,6 +43,18 @@ export interface SettlementAssessment {
   ready: boolean;
 }
 
+export type SettlementPollDecision = 'settled' | 'continue' | 'timeout';
+
+/** A completed ready read wins over the deadline; only a non-ready read can time out. */
+export function decideSettlementPoll(
+  assessment: SettlementAssessment,
+  completedAtMs: number,
+  deadlineAtMs: number,
+): SettlementPollDecision {
+  if (assessment.ready) return 'settled';
+  return completedAtMs >= deadlineAtMs ? 'timeout' : 'continue';
+}
+
 /** Require a reconciled balance and an unchanged balance/win pair. */
 export function assessSettlementRead(
   current: SlotReadout,

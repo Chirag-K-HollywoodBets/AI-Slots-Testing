@@ -7,6 +7,7 @@ import { navigateToSlotGame } from '../../src/agent/slot-navigation';
 import { guardSlotAction, MAX_WAGER } from '../../src/agent/slot-safety';
 import {
   assessSettlementRead,
+  decideSettlementPoll,
   normalizeSlotReadout,
   type SlotReadout,
 } from '../../src/agent/slot-settlement';
@@ -18,7 +19,7 @@ const GAME_LOAD_TIMEOUT_MS = 90_000;
 const SPIN_FINISH_TIMEOUT_MS = 60_000;
 const MIDSCENE_POLL_INTERVAL_MS = 4_000;
 const SCOUT_MAX_SPINS = 20;
-const BALANCE_SETTLEMENT_TIMEOUT_MS = 20_000;
+const BALANCE_SETTLEMENT_TIMEOUT_MS = 45_000;
 const BALANCE_SETTLEMENT_POLL_MS = 2_000;
 
 interface UnexpectedStates {
@@ -123,7 +124,9 @@ async function waitForSettledSlotValues(
         `reconciled=${assessment.reconciled}, stable=${assessment.stable}`,
       );
 
-      if (assessment.ready && Date.now() <= deadline) return current;
+      const decision = decideSettlementPoll(assessment, Date.now(), deadline);
+      if (decision === 'settled') return current;
+      if (decision === 'timeout') break;
       previous = current;
     } catch (error) {
       // A failed or malformed observation breaks the consecutive-read pair.
