@@ -13,8 +13,8 @@ const GAME_LOAD_TIMEOUT_MS = 90_000;
 const SPIN_FINISH_TIMEOUT_MS = 60_000;
 const MIDSCENE_POLL_INTERVAL_MS = 4_000;
 const SCOUT_MAX_SPINS = 20;
-const BALANCE_STABILITY_ATTEMPTS = 5;
-const BALANCE_STABILITY_DELAY_MS = 1_500;
+const BALANCE_SETTLEMENT_TIMEOUT_MS = 20_000;
+const BALANCE_SETTLEMENT_POLL_MS = 2_000;
 
 interface SlotReadout {
   bet: number;
@@ -43,6 +43,19 @@ interface SpinRecord {
   waitMs?: number;
   readMs?: number;
   status: string;
+}
+
+class BalanceSettlementTimeoutError extends Error {
+  constructor(
+    readonly lastRead: SlotReadout | undefined,
+    readonly expectedBalance: number | undefined,
+  ) {
+    const summary = lastRead && expectedBalance !== undefined
+      ? `last expected R${expectedBalance.toFixed(2)}, actual R${lastRead.balance.toFixed(2)}, win R${lastRead.win.toFixed(2)}`
+      : 'no valid balance read was received';
+    super(`BALANCE_SETTLEMENT_TIMEOUT after ${BALANCE_SETTLEMENT_TIMEOUT_MS}ms: ${summary}.`);
+    this.name = 'BalanceSettlementTimeoutError';
+  }
 }
 
 function parseArgs(): { spins: number; headed: boolean } {
@@ -90,20 +103,56 @@ async function readSlotValues(agent: PlaywrightPageAgent): Promise<SlotReadout> 
   return values;
 }
 
-async function readStableSlotValues(agent: PlaywrightPageAgent): Promise<SlotReadout> {
-  let lastPair: [number, number] | undefined;
-  for (let attempt = 1; attempt <= BALANCE_STABILITY_ATTEMPTS; attempt++) {
-    const first = await readSlotValues(agent);
-    await new Promise((resolve) => setTimeout(resolve, BALANCE_STABILITY_DELAY_MS));
-    const second = await readSlotValues(agent);
-    lastPair = [first.balance, second.balance];
-    if (Math.round(first.balance * 100) === Math.round(second.balance * 100)) return second;
+async function waitForSettledSlotValues(
+  agent: PlaywrightPageAgent,
+  balanceBefore: number,
+  bet: number,
+  spin: number,
+): Promise<SlotReadout> {
+  const deadline = Date.now() + BALANCE_SETTLEMENT_TIMEOUT_MS;
+  let previous: SlotReadout | undefined;
+  let lastRead: SlotReadout | undefined;
+  let lastExpectedBalance: number | undefined;
+  let readNumber = 0;
+
+  while (Date.now() < deadline) {
+    readNumber++;
+    try {
+      // One aiQuery reads all three values from the same visual observation.
+      const current = await readSlotValues(agent);
+      lastRead = current;
+      lastExpectedBalance = Math.round((balanceBefore - bet + current.win) * 100) / 100;
+      const delta = Math.abs(current.balance - lastExpectedBalance);
+      const tolerance = 0.01 + Number.EPSILON * 4 * Math.max(1, current.balance, lastExpectedBalance);
+      const reconciled = delta <= tolerance;
+      const stable = previous !== undefined
+        && Math.round(previous.balance * 100) === Math.round(current.balance * 100)
+        && Math.round(previous.win * 100) === Math.round(current.win * 100);
+
+      console.log(
+        `[spin ${spin}] settlement read ${readNumber}: bet=R${current.bet.toFixed(2)}, ` +
+        `balance=R${current.balance.toFixed(2)}, win=R${current.win.toFixed(2)}, ` +
+        `expected=R${lastExpectedBalance.toFixed(2)}, delta=R${delta.toFixed(2)}, ` +
+        `reconciled=${reconciled}, stable=${stable}`,
+      );
+
+      if (reconciled && stable && Date.now() <= deadline) return current;
+      previous = current;
+    } catch (error) {
+      // A failed or malformed observation breaks the consecutive-read pair.
+      previous = undefined;
+      console.log(
+        `[spin ${spin}] settlement read ${readNumber} failed: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (remainingMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Math.min(BALANCE_SETTLEMENT_POLL_MS, remainingMs)));
+    }
   }
 
-  throw new Error(
-    `BALANCE_NOT_STABLE_AFTER_${BALANCE_STABILITY_ATTEMPTS}_ATTEMPTS: ` +
-    `last reads were R${lastPair?.[0].toFixed(2)} and R${lastPair?.[1].toFixed(2)}.`,
-  );
+  throw new BalanceSettlementTimeoutError(lastRead, lastExpectedBalance);
 }
 
 async function detectUnexpectedStates(agent: PlaywrightPageAgent): Promise<string[]> {
@@ -265,9 +314,9 @@ async function main(): Promise<void> {
         );
         record.waitMs = Math.round(performance.now() - started);
 
-        currentStep = `spin ${index}: stabilize balance and read win`;
+        currentStep = `spin ${index}: wait for balance settlement`;
         started = performance.now();
-        const after = await readStableSlotValues(agent);
+        const after = await waitForSettledSlotValues(agent, currentBalance, currentBet, index);
         record.readMs = Math.round(performance.now() - started);
         record.win = after.win;
         record.balanceAfter = after.balance;
@@ -293,6 +342,18 @@ async function main(): Promise<void> {
         await detectUnexpectedStates(agent);
         record.status = 'PASS';
       } catch (error) {
+        if (error instanceof BalanceSettlementTimeoutError && error.lastRead && error.expectedBalance !== undefined) {
+          record.win = error.lastRead.win;
+          record.balanceAfter = error.lastRead.balance;
+          record.balanceChanged = Math.round(error.lastRead.balance * 100) !== Math.round(currentBalance * 100);
+          record.expectedBalance = error.expectedBalance;
+          record.actualBalance = error.lastRead.balance;
+          record.reconciliation = `expected R${error.expectedBalance.toFixed(2)} vs actual R${error.lastRead.balance.toFixed(2)}`;
+          console.error(
+            `Spin ${index} settlement timed out: expected R${error.expectedBalance.toFixed(2)}, ` +
+            `actual R${error.lastRead.balance.toFixed(2)}, win R${error.lastRead.win.toFixed(2)}.`,
+          );
+        }
         record.status = `FAILED: ${currentStep}`;
         throw error;
       }
