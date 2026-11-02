@@ -1,5 +1,7 @@
 import { chromium, type Browser, type Page } from 'playwright';
 import { PlaywrightPageAgent } from '@midscene/web/playwright';
+import { mkdir, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
 import { loginTestAccount } from '../../src/agent/test-account-login';
 import { navigateToSlotGame } from '../../src/agent/slot-navigation';
 import { guardSlotAction, MAX_WAGER } from '../../src/agent/slot-safety';
@@ -10,31 +12,51 @@ const VIEWPORT = { width: 1024, height: 576 };
 const GAME_LOAD_TIMEOUT_MS = 90_000;
 const SPIN_FINISH_TIMEOUT_MS = 60_000;
 const MIDSCENE_POLL_INTERVAL_MS = 4_000;
+const SCOUT_MAX_SPINS = 20;
+const BALANCE_STABILITY_ATTEMPTS = 5;
+const BALANCE_STABILITY_DELAY_MS = 1_500;
 
 interface SlotReadout {
   bet: number;
   balance: number;
+  win: number;
+}
+
+interface UnexpectedStates {
+  freeSpinsPopup: boolean;
+  bigWinScreen: boolean;
+  blockingDialog: boolean;
+  details: string;
 }
 
 interface SpinRecord {
   spin: number;
   balanceBefore?: number;
+  bet?: number;
+  win?: number;
   balanceAfter?: number;
   balanceChanged?: boolean;
+  expectedBalance?: number;
+  actualBalance?: number;
+  reconciliation?: string;
   locateTapMs?: number;
   waitMs?: number;
   readMs?: number;
   status: string;
 }
 
-function spinCountFromArgs(): number {
-  const raw = process.argv[2];
-  if (raw === undefined) return 1;
+function parseArgs(): { spins: number; headed: boolean } {
+  const args = process.argv.slice(2);
+  const headed = args.includes('--headed');
+  const positional = args.filter((arg) => arg !== '--headed');
+  if (positional.length > 1) throw new Error(`Usage: slot-scout.ts [spins: 1-${SCOUT_MAX_SPINS}] [--headed]`);
+  const raw = positional[0];
+  if (raw === undefined) return { spins: 1, headed };
   const count = Number(raw);
-  if (!Number.isInteger(count) || count < 1 || count > 5) {
-    throw new Error('Spin count must be a whole number from 1 to 5.');
+  if (!Number.isInteger(count) || count < 1 || count > SCOUT_MAX_SPINS) {
+    throw new Error(`Spin count must be a whole number from 1 to ${SCOUT_MAX_SPINS}.`);
   }
-  return count;
+  return { spins: count, headed };
 }
 
 function requireEnvironment(): { username: string; password: string } {
@@ -54,16 +76,77 @@ function requireEnvironment(): { username: string; password: string } {
 
 async function readSlotValues(agent: PlaywrightPageAgent): Promise<SlotReadout> {
   const values = await agent.aiQuery(
-    '{ bet: number, balance: number }, read the current bet per spin and the account balance. ' +
-    'Return both as numeric amounts in South African rand, without currency symbols or text.'
+    '{ bet: number, balance: number, win: number }, read the current bet per spin, account balance, ' +
+    'and the win amount shown for the most recently completed spin. Return numeric amounts in South African rand, ' +
+    'without currency symbols or text. If no win amount is shown, return win: 0.'
   ) as SlotReadout;
 
   if (!values || typeof values !== 'object'
     || typeof values.bet !== 'number' || !Number.isFinite(values.bet)
-    || typeof values.balance !== 'number' || !Number.isFinite(values.balance)) {
-    throw new Error('Midscene did not return numeric bet and balance values.');
+    || typeof values.balance !== 'number' || !Number.isFinite(values.balance)
+    || typeof values.win !== 'number' || !Number.isFinite(values.win) || values.win < 0) {
+    throw new Error('Midscene did not return numeric bet, balance, and win values.');
   }
   return values;
+}
+
+async function readStableSlotValues(agent: PlaywrightPageAgent): Promise<SlotReadout> {
+  let lastPair: [number, number] | undefined;
+  for (let attempt = 1; attempt <= BALANCE_STABILITY_ATTEMPTS; attempt++) {
+    const first = await readSlotValues(agent);
+    await new Promise((resolve) => setTimeout(resolve, BALANCE_STABILITY_DELAY_MS));
+    const second = await readSlotValues(agent);
+    lastPair = [first.balance, second.balance];
+    if (Math.round(first.balance * 100) === Math.round(second.balance * 100)) return second;
+  }
+
+  throw new Error(
+    `BALANCE_NOT_STABLE_AFTER_${BALANCE_STABILITY_ATTEMPTS}_ATTEMPTS: ` +
+    `last reads were R${lastPair?.[0].toFixed(2)} and R${lastPair?.[1].toFixed(2)}.`,
+  );
+}
+
+async function detectUnexpectedStates(agent: PlaywrightPageAgent): Promise<string[]> {
+  const state = await agent.aiQuery(
+    '{ freeSpinsPopup: boolean, bigWinScreen: boolean, blockingDialog: boolean, details: string }, ' +
+    'check whether an unexpected game overlay is active. freeSpinsPopup is true only for a modal/popup ' +
+    'about free spins that overlays the playfield; a persistent free-spins banner alone is false. ' +
+    'bigWinScreen is true for an active Big Win/Mega Win style overlay. blockingDialog is true for any ' +
+    'dialog or modal covering the game. Return all booleans and a short details string.'
+  ) as UnexpectedStates;
+
+  if (!state || typeof state !== 'object'
+    || typeof state.freeSpinsPopup !== 'boolean'
+    || typeof state.bigWinScreen !== 'boolean'
+    || typeof state.blockingDialog !== 'boolean') {
+    throw new Error('Midscene could not classify unexpected game states.');
+  }
+  const found: string[] = [];
+  if (state.freeSpinsPopup) found.push('free spins popup');
+  if (state.bigWinScreen) found.push('big win screen');
+  if (state.blockingDialog) found.push('dialog covering the game');
+  if (found.length) throw new Error(`UNEXPECTED_GAME_STATE: ${found.join(', ')}${state.details ? ` (${state.details})` : ''}`);
+  return found;
+}
+
+function csvCell(value: unknown): string {
+  const text = value === undefined || value === null ? '' : String(value);
+  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+}
+
+async function writeResultsCsv(records: SpinRecord[]): Promise<void> {
+  const outputPath = resolve('midscene_run/scout-results.csv');
+  await mkdir(resolve('midscene_run'), { recursive: true });
+  const columns: Array<keyof SpinRecord> = [
+    'spin', 'balanceBefore', 'bet', 'win', 'balanceAfter', 'balanceChanged',
+    'expectedBalance', 'actualBalance', 'reconciliation', 'locateTapMs', 'waitMs', 'readMs', 'status',
+  ];
+  const lines = [
+    columns.join(','),
+    ...records.map((record) => columns.map((column) => csvCell(record[column])).join(',')),
+  ];
+  await writeFile(outputPath, `${lines.join('\r\n')}\r\n`, 'utf8');
+  console.log(`Results CSV saved: ${outputPath}`);
 }
 
 async function verifySignedIn(page: Page): Promise<void> {
@@ -77,40 +160,61 @@ async function verifySignedIn(page: Page): Promise<void> {
 
 async function main(): Promise<void> {
   const records: SpinRecord[] = [];
-  const targetSpins = spinCountFromArgs();
+  const { spins: targetSpins, headed } = parseArgs();
   const credentials = requireEnvironment();
   let browser: Browser | undefined;
+  let page: Page | undefined;
   let agent: PlaywrightPageAgent | undefined;
   let currentStep = 'launch Edge';
   let failed = false;
+  let screenshotSaved = false;
+  const screenshotPath = resolve('midscene_run/scout-failure.png');
+  const saveFailureScreenshot = async () => {
+    if (!page || screenshotSaved) return;
+    try {
+      await mkdir(resolve('midscene_run'), { recursive: true });
+      await page.screenshot({ path: screenshotPath, fullPage: true });
+      screenshotSaved = true;
+      console.error(`Failure screenshot saved: ${screenshotPath}`);
+    } catch (screenshotError) {
+      console.error(`Could not save failure screenshot: ${screenshotError instanceof Error ? screenshotError.message : String(screenshotError)}`);
+    }
+  };
 
   try {
-    browser = await chromium.launch({ channel: 'msedge', headless: false });
-    const context = await browser.newContext({ viewport: VIEWPORT });
-    const page = await context.newPage();
+    browser = await chromium.launch({ channel: 'msedge', headless: !headed });
+    // Keep Playwright's normal 1280x720 default viewport for login/navigation.
+    const context = await browser.newContext();
+    const activePage = await context.newPage();
+    page = activePage;
 
     currentStep = 'log in to the test account';
     await loginTestAccount({
-      openHome: async () => { await page.goto(SITE_ORIGIN, { waitUntil: 'domcontentloaded' }); },
-      clickLogin: async () => { await page.getByRole('button', { name: /log in/i }).click(); },
-      waitForUsername: async () => { await page.locator('#Username').waitFor({ state: 'visible', timeout: 20_000 }); },
-      fillUsername: async (username) => { await page.locator('#Username').fill(username); },
-      fillPassword: async (password) => { await page.locator('#password').fill(password); },
-      submit: async () => { await page.locator('#btnLogin').click(); },
+      openHome: async () => { await activePage.goto(SITE_ORIGIN, { waitUntil: 'domcontentloaded' }); },
+      clickLogin: async () => { await activePage.getByRole('button', { name: /log in/i }).click(); },
+      waitForUsername: async () => { await activePage.locator('#Username').waitFor({ state: 'visible', timeout: 20_000 }); },
+      fillUsername: async (username) => { await activePage.locator('#Username').fill(username); },
+      fillPassword: async (password) => { await activePage.locator('#password').fill(password); },
+      submit: async () => { await activePage.locator('#btnLogin').click(); },
       waitForSignedInUrl: async () => {
-        await page.waitForURL(/^https:\/\/www\.hollywoodbets\.net\//, { timeout: 30_000 });
+        await activePage.waitForURL(/^https:\/\/www\.hollywoodbets\.net\//, { timeout: 30_000 });
       },
-      verifySignedIn: () => verifySignedIn(page),
+      verifySignedIn: () => verifySignedIn(activePage),
     }, credentials);
 
     currentStep = 'open Games in Olympus';
     await navigateToSlotGame(GAME_ID, SITE_ORIGIN, (url) =>
-      page.goto(url, { waitUntil: 'domcontentloaded', timeout: 90_000 }));
-    agent = new PlaywrightPageAgent(page, { cache: false });
+      activePage.goto(url, { waitUntil: 'domcontentloaded', timeout: 90_000 }));
 
-    currentStep = 'wait for the game canvas to load';
+    currentStep = 'resize game viewport';
+    await activePage.setViewportSize(VIEWPORT);
+    // Allow the game's resize handler to redraw its canvas at the scouting size.
+    await activePage.waitForTimeout(1_000);
+    agent = new PlaywrightPageAgent(activePage, { cache: false });
+
+    currentStep = 'wait for the resized game canvas to render';
     await agent.aiWaitFor(
-      'The Games in Olympus slot game has finished loading, its game canvas is visible, and the spin button is displayed.',
+      'The resized Games in Olympus game has finished rendering, its game canvas is visible, and the spin button is displayed.',
       { timeoutMs: GAME_LOAD_TIMEOUT_MS, checkIntervalMs: MIDSCENE_POLL_INTERVAL_MS },
     );
 
@@ -125,21 +229,28 @@ async function main(): Promise<void> {
       );
     }
     guardSlotAction({ type: 'wager', wager: initial.bet });
-    guardSlotAction({ type: 'spin', spins: targetSpins });
+    guardSlotAction({ type: 'spin', spins: targetSpins }, { maxSpins: SCOUT_MAX_SPINS });
 
     let currentBalance = initial.balance;
+    let currentBet = initial.bet;
     for (let index = 1; index <= targetSpins; index++) {
       const record: SpinRecord = {
         spin: index,
         balanceBefore: currentBalance,
+        bet: currentBet,
         status: 'RUNNING',
       };
       records.push(record);
 
       try {
+        if (index === 1) {
+          currentStep = `spin ${index}: unexpected-state check`;
+          await detectUnexpectedStates(agent);
+        }
+
         currentStep = `spin ${index}: safety guard`;
-        guardSlotAction({ type: 'wager', wager: initial.bet });
-        guardSlotAction({ type: 'spin', spins: index });
+        guardSlotAction({ type: 'wager', wager: currentBet });
+        guardSlotAction({ type: 'spin', spins: index }, { maxSpins: SCOUT_MAX_SPINS });
 
         currentStep = `spin ${index}: locate/tap spin button`;
         let started = performance.now();
@@ -154,13 +265,32 @@ async function main(): Promise<void> {
         );
         record.waitMs = Math.round(performance.now() - started);
 
-        currentStep = `spin ${index}: read balance`;
+        currentStep = `spin ${index}: stabilize balance and read win`;
         started = performance.now();
-        const after = await readSlotValues(agent);
+        const after = await readStableSlotValues(agent);
         record.readMs = Math.round(performance.now() - started);
+        record.win = after.win;
         record.balanceAfter = after.balance;
         record.balanceChanged = Math.round(after.balance * 100) !== Math.round(currentBalance * 100);
+        record.expectedBalance = Math.round((currentBalance - currentBet + after.win) * 100) / 100;
+        record.actualBalance = after.balance;
+        record.reconciliation = `expected R${record.expectedBalance.toFixed(2)} vs actual R${after.balance.toFixed(2)}`;
         currentBalance = after.balance;
+        currentBet = after.bet;
+
+        currentStep = `spin ${index}: balance reconciliation`;
+        const difference = Math.abs(after.balance - record.expectedBalance);
+        const centTolerance = 0.01 + Number.EPSILON * 4 * Math.max(1, after.balance, record.expectedBalance);
+        if (difference > centTolerance) {
+          console.error(
+            `Spin ${index} balance mismatch: expected R${record.expectedBalance.toFixed(2)}, ` +
+            `actual R${after.balance.toFixed(2)} (bet R${record.bet!.toFixed(2)}, win R${after.win.toFixed(2)}).`,
+          );
+          throw new Error('BALANCE_RECONCILIATION_FAILED');
+        }
+
+        currentStep = `spin ${index}: unexpected-state check`;
+        await detectUnexpectedStates(agent);
         record.status = 'PASS';
       } catch (error) {
         record.status = `FAILED: ${currentStep}`;
@@ -170,14 +300,24 @@ async function main(): Promise<void> {
   } catch (error) {
     failed = true;
     console.error(`SCOUT FAILED at ${currentStep}: ${error instanceof Error ? error.message : String(error)}`);
+    await saveFailureScreenshot();
   } finally {
+    try {
+      await writeResultsCsv(records);
+    } catch (error) {
+      failed = true;
+      console.error(`SCOUT FAILED while writing CSV: ${error instanceof Error ? error.message : String(error)}`);
+      await saveFailureScreenshot();
+    }
     await agent?.destroy().catch((error: unknown) => {
       failed = true;
       console.error(`SCOUT FAILED while closing Midscene: ${error instanceof Error ? error.message : String(error)}`);
+      return saveFailureScreenshot();
     });
     await browser?.close().catch((error: unknown) => {
       failed = true;
       console.error(`SCOUT FAILED while closing Edge: ${error instanceof Error ? error.message : String(error)}`);
+      return saveFailureScreenshot();
     });
   }
 

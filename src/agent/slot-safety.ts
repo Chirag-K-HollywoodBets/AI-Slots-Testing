@@ -6,7 +6,7 @@ export type SlotAction =
   | { type: 'spin'; spins: number };
 
 /** Throw before a slot action if its value is invalid or exceeds the fixed caps. */
-export function guardSlotAction(action: SlotAction): void {
+export function guardSlotAction(action: SlotAction, limits: { maxSpins?: number } = {}): void {
   if (action.type === 'wager') {
     if (!Number.isFinite(action.wager) || action.wager <= 0 || action.wager > MAX_WAGER) {
       throw new Error('WAGER_LIMIT_EXCEEDED');
@@ -14,7 +14,9 @@ export function guardSlotAction(action: SlotAction): void {
     return;
   }
 
-  if (!Number.isInteger(action.spins) || action.spins <= 0 || action.spins > MAX_SPINS) {
+  const maxSpins = limits.maxSpins === undefined ? MAX_SPINS : Math.min(MAX_SPINS, limits.maxSpins);
+  if (!Number.isInteger(maxSpins) || maxSpins < 1
+    || !Number.isInteger(action.spins) || action.spins <= 0 || action.spins > maxSpins) {
     throw new Error('SPIN_LIMIT_EXCEEDED');
   }
 }
