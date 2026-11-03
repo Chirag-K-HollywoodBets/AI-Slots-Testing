@@ -9,7 +9,7 @@ import { loginTestAccount } from '../../src/agent/test-account-login';
 test.setup('sign in to the HollywoodBets test account', { sessions: ['hb-test'] }, async ({ app, browser, screen, session }) => {
   const user = credentials.user('hb-test');
  
-  await loginTestAccount({
+  await loginTestAccount<string | typeof user.password>({
     openHome: () => app.open('/'),
     clickLogin: () => screen.getByRole('button', /log in/i).tap(),
     waitForUsername: () => expect(browser.locator('#Username')).toBeVisible({ timeout: 20000 }),
@@ -22,7 +22,7 @@ test.setup('sign in to the HollywoodBets test account', { sessions: ['hb-test'] 
       await expect(browser.locator('.account .balance-value').first()).toBeVisible({ timeout: 20000 });
       await expect(browser.locator('.account .balance-value').first()).toContainText(/R\s?[\d\s]+,\d{2}/);
     },
-  }, user);
+  }, { username: user.username, password: user.password });
  
   await session.save('hb-test');
 });
