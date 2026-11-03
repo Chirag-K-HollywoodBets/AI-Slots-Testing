@@ -74,10 +74,14 @@ async function runMidsceneCall<T>(
     console.log(`[MIDSCENE_CALL] step=${step} timeoutMs=${timeoutMs} page.url=${JSON.stringify(midsceneUrl)} runner.page.url=${JSON.stringify(runnerUrl)}`);
     if (midsceneUrl !== runnerUrl) throw new Error('MIDSCENE_PAGE_URL_MISMATCH');
 
-    const markerOnMidscenePage = await page.evaluate((key) => Reflect.get(window, key), markerKey);
-    const markerOnRunnerPage = await runnerBrowser.evaluate((key: string) => Reflect.get(window, key), markerKey);
-    if (markerOnMidscenePage !== markerToken || markerOnRunnerPage !== markerToken) {
-      throw new Error('MIDSCENE_PAGE_OBJECT_MISMATCH');
+    let markerOnMidscenePage: unknown;
+    try {
+      markerOnMidscenePage = await page.evaluate((key) => Reflect.get(window, key), markerKey);
+    } catch (error) {
+      throw new Error('MIDSCENE_PAGE_BINDING_LOST', { cause: error });
+    }
+    if (markerOnMidscenePage !== markerToken) {
+      throw new Error('MIDSCENE_PAGE_BINDING_LOST');
     }
     return await action();
   } catch (error) {
