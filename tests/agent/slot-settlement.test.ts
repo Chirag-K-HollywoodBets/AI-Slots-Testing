@@ -2,12 +2,17 @@ import { describe, expect, it } from 'vitest';
 import {
   assessSettlementRead,
   decideSettlementPoll,
+  expectedSlotBalanceAfterSpins,
   normalizeSlotReadout,
   parseRand,
   type SlotReadout,
 } from '../../src/agent/slot-settlement';
 
 describe('slot balance settlement', () => {
+  it('computes the final balance from the confirmed wager count and total wins', () => {
+    expect(expectedSlotBalanceAfterSpins(100, 3, 0.2, 2.35)).toBe(101.75);
+  });
+
   it.each([
     ['R 1 012,57', 1012.57],
     ['R1,012.57', 1012.57],

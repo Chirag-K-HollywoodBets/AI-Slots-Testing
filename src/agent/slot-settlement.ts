@@ -26,6 +26,20 @@ function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }
 
+/** Expected final balance after exactly the confirmed paid spins and reported wins. */
+export function expectedSlotBalanceAfterSpins(
+  balanceBefore: number,
+  spins: number,
+  stake: number,
+  totalWon: number,
+): number {
+  if (![balanceBefore, stake, totalWon].every(Number.isFinite)
+    || !Number.isInteger(spins) || spins < 1 || balanceBefore < 0 || stake <= 0 || totalWon < 0) {
+    throw new Error('INVALID_SLOT_SETTLEMENT');
+  }
+  return roundMoney(balanceBefore - spins * stake + totalWon);
+}
+
 function normalizeMoney(value: unknown, field: string, missingAsZero = false): number {
   if ((value === null || value === undefined || value === '') && missingAsZero) return 0;
 

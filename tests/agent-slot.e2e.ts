@@ -12,7 +12,7 @@ import { dirname } from 'node:path';
 import { executePlan } from '../src/agent/executor';
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
-import { parseRand } from '../src/agent/slot-settlement';
+import { expectedSlotBalanceAfterSpins, parseRand } from '../src/agent/slot-settlement';
 import { configureMidsceneModel, logMidsceneModelConfig } from '../src/agent/midscene-model';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
@@ -187,7 +187,7 @@ test(
         midsceneAgent = new PlaywrightPageAgent(midscenePage, { cache: false });
 
         // Runtime capability restriction: the adapter receives a new object with only
-        // these three methods; the full agent is never passed across this boundary.
+        // read-only methods; the full agent is never passed across this boundary.
         const invokeMidscene = <T>(step: string, spin: number | null, timeoutMs: MidsceneTimeout, action: () => Promise<T>) => {
           return runMidsceneCall(step, timeoutMs, midscenePage!, browser, pageBindingKey!, pageBindingToken!, action)
             .catch((error: unknown) => {
@@ -208,7 +208,17 @@ test(
             return invokeMidscene('stake assertion', 1, 'Midscene default', () => midsceneAgent!.aiAssert(...args));
           },
           aiQuery: (...args) => {
-            return invokeMidscene('balance fallback query', null, 'Midscene default', () => midsceneAgent!.aiQuery(...args));
+            const prompt = String(args[0] ?? '');
+            const step = prompt.includes('overlay') ? 'overlay state' : 'balance fallback query';
+            const spinMatch = prompt.match(/spin (?:number )?(\d+)/i);
+            return invokeMidscene(step, spinMatch ? Number(spinMatch[1]) : null, 'Midscene default',
+              () => midsceneAgent!.aiQuery(...args));
+          },
+          aiLocate: (...args) => {
+            const prompt = String(args[0] ?? '');
+            const spinMatch = prompt.match(/spin (?:number )?(\d+)/i);
+            return invokeMidscene('overlay dismissal location', spinMatch ? Number(spinMatch[1]) : null,
+              'Midscene default', () => midsceneAgent!.aiLocate(...args));
           },
         };
         return readOnlyMidscene;
@@ -229,6 +239,8 @@ test(
       const report = await runPhase('Open Games in Olympus, verify R0.20, and play the confirmed spins', async () =>
         executePlan(plan, adapter));
       const durationMs = Date.now() - started;
+      const slotObservation = report.results.find((result) => result.action.type === 'play_slot')?.observation;
+      const spinResults = Array.isArray(slotObservation) ? slotObservation as Array<{ stake: number; win: number; balance: number }> : [];
 
       const actionReports = report.results.map((r) => ({
         type: r.action.type,
@@ -290,7 +302,18 @@ test(
         if (balanceAfter === null || !Number.isFinite(balanceAfter) || balanceAfter < 0) {
           throw new Error('BALANCE_AFTER_INVALID');
         }
-        if (balanceAfter === balanceBefore) throw new Error('BALANCE_DID_NOT_CHANGE');
+        if (balanceBefore === null || spinResults.length !== Number(process.env.HB_SPINS ?? '1')) {
+          throw new Error('SPIN_SETTLEMENT_DATA_INCOMPLETE');
+        }
+        const totalWon = spinResults.reduce((sum, spin) => sum + spin.win, 0);
+        const expectedBalance = expectedSlotBalanceAfterSpins(
+          balanceBefore,
+          spinResults.length,
+          spinResults[0].stake,
+          totalWon,
+        );
+        console.log(`Balance settlement: before=R${balanceBefore.toFixed(2)} spins=${spinResults.length} stake=R${spinResults[0].stake.toFixed(2)} totalWon=R${totalWon.toFixed(2)} expected=R${expectedBalance.toFixed(2)} actual=R${balanceAfter.toFixed(2)}`);
+        if (balanceAfter !== expectedBalance) throw new Error('BALANCE_SETTLEMENT_MISMATCH');
         return value;
       });
 
