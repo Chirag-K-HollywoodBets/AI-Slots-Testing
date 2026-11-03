@@ -4,6 +4,24 @@ export interface SlotReadout {
   win: number;
 }
 
+/** Parse rand text with either a comma or dot decimal and common thousands separators. */
+export function parseRand(value: unknown): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (typeof value !== 'string') throw new Error('INVALID_RAND_AMOUNT');
+
+  const normalized = value.trim().replace(/^R\s*/i, '').replace(/[\s\u00a0\u202f]/g, '');
+  const decimal = normalized.match(/([,.])(\d{2})$/);
+  const whole = decimal ? normalized.slice(0, -3) : normalized;
+  const ungrouped = /^\d+$/.test(whole);
+  const grouped = /^(\d{1,3})([,.])(\d{3})(?:\2\d{3})*$/.test(whole);
+  if (!ungrouped && !grouped) throw new Error('INVALID_RAND_AMOUNT');
+
+  const digits = whole.replace(/[,.]/g, '');
+  const parsed = Number(decimal ? `${digits}.${decimal[2]}` : digits);
+  if (!Number.isFinite(parsed)) throw new Error('INVALID_RAND_AMOUNT');
+  return parsed;
+}
+
 function roundMoney(value: number): number {
   return Math.round((value + Number.EPSILON) * 100) / 100;
 }

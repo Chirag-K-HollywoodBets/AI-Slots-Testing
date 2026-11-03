@@ -412,11 +412,10 @@ export function createE2EBrowserAdapter(
           'Games in Olympus is fully loaded in the game canvas, the reels are visible, and the spin button is visible.',
           { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
         );
-      } catch {
-        console.error('MIDSCENE_STEP=game readiness FAILED');
+      } catch (error) {
         await browser.unroute(GAME_SERVICE);
         slotGuard = null;
-        throw new Error('MIDSCENE_GAME_READY_FAILED');
+        throw new Error('MIDSCENE_GAME_READY_FAILED', { cause: error });
       }
       return { frameSrc: rect.host };
     },
@@ -460,11 +459,12 @@ export function createE2EBrowserAdapter(
       }
       try {
         await midscene.aiAssert('The stake displayed in the game canvas is exactly R0.20 and ante bet is off.');
-      } catch {
-        console.error('MIDSCENE_STEP=stake assertion spin=1 FAILED');
+      } catch (error) {
         await browser.unroute(GAME_SERVICE);
         slotGuard = null;
-        throw new SlotRunError('MIDSCENE_STAKE_ASSERT_FAILED', 0, 0);
+        const failure = new SlotRunError('MIDSCENE_STAKE_ASSERT_FAILED', 0, 0);
+        (failure as Error & { cause?: unknown }).cause = error;
+        throw failure;
       }
  
       // Network guard: every doSpin request is checked before it leaves the browser.
@@ -552,9 +552,8 @@ export function createE2EBrowserAdapter(
               `Spin number ${i + 1} is finished: all reels have stopped and the spin button is visible and active again.`,
               { timeoutMs: MIDSCENE_SPIN_FINISH_TIMEOUT_MS, checkIntervalMs: 1500 },
             );
-          } catch {
-            console.error(`MIDSCENE_STEP=spin completion spin=${i + 1} FAILED`);
-            throw new Error('MIDSCENE_SPIN_FINISH_FAILED');
+          } catch (error) {
+            throw new Error(`MIDSCENE_SPIN_FINISH_FAILED_${i + 1}`, { cause: error });
           }
  
           results.push({ stake: first.stake, win, balance });

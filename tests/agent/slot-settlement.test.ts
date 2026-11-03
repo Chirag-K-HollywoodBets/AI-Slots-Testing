@@ -3,10 +3,24 @@ import {
   assessSettlementRead,
   decideSettlementPoll,
   normalizeSlotReadout,
+  parseRand,
   type SlotReadout,
 } from '../../src/agent/slot-settlement';
 
 describe('slot balance settlement', () => {
+  it.each([
+    ['R 1 012,57', 1012.57],
+    ['R1,012.57', 1012.57],
+    ['R 0,20', 0.2],
+    ['R 12 345 678,90', 12345678.9],
+  ])('parses %s as %s', (value, expected) => {
+    expect(parseRand(value)).toBe(expected);
+  });
+
+  it('throws for an invalid rand string', () => {
+    expect(() => parseRand('not a balance')).toThrow('INVALID_RAND_AMOUNT');
+  });
+
   it('settles the recorded spin 2 values when zero win formats vary', () => {
     const reads: unknown[] = [
       { bet: 0.2, balance: 1020.93, win: 0 },

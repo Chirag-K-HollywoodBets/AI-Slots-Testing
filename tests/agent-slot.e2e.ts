@@ -3,7 +3,8 @@
 
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
-import { chromium } from 'playwright';
+import { randomUUID } from 'node:crypto';
+import { chromium, type CDPSession, type Page } from 'playwright';
 import { PlaywrightPageAgent } from '@midscene/web/playwright';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -11,18 +12,11 @@ import { dirname } from 'node:path';
 import { executePlan } from '../src/agent/executor';
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
+import { parseRand } from '../src/agent/slot-settlement';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
 const CDP_ENDPOINT = 'http://127.0.0.1:9223';
-
-export function parseRand(value: string | number | null | undefined): number | null {
-  if (typeof value === 'number') return Number.isFinite(value) ? value : null;
-  if (typeof value !== 'string') return null;
-  const match = value.match(/R\s*([\d\s,]+(?:\.\d{1,2})?)/i) ?? value.match(/([\d,]+(?:\.\d{1,2})?)/);
-  if (!match) return null;
-  const parsed = Number(match[1].replace(/[\s,]/g, ''));
-  return Number.isFinite(parsed) ? parsed : null;
-}
+type MidsceneTimeout = number | 'Midscene default';
 
 async function runPhase<T>(name: string, action: () => Promise<T>): Promise<T> {
   console.log(`PHASE START: ${name}`);
@@ -34,6 +28,63 @@ async function runPhase<T>(name: string, action: () => Promise<T>): Promise<T> {
     const detail = error instanceof Error ? error.message : String(error);
     console.error(`PHASE FAILED: ${name}: ${detail}`);
     throw new Error(`PHASE FAILED: ${name}: ${detail}`);
+  }
+}
+
+function redactModelSecret(text: string): string {
+  const secrets = [process.env.MIDSCENE_MODEL_API_KEY, process.env.LLM_API_KEY].filter(
+    (value): value is string => Boolean(value),
+  );
+  return secrets.reduce((safe, secret) => safe.replaceAll(secret, '[REDACTED]'), text);
+}
+
+function midsceneErrorDetails(error: unknown, depth = 0): Record<string, unknown> {
+  if (depth > 4) return { cause: '[cause depth limit]' };
+  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
+  const response = record.response && typeof record.response === 'object'
+    ? record.response as Record<string, unknown> : {};
+  const message = error instanceof Error ? error.message : String(error);
+  const name = typeof record.name === 'string' ? record.name : typeof error;
+  const status = [record.statusCode, record.status, response.status]
+    .find((value) => typeof value === 'number');
+  const cause = record.cause;
+  return {
+    name,
+    message: redactModelSecret(message),
+    ...(typeof record.code === 'string' || typeof record.code === 'number' ? { code: record.code } : {}),
+    ...(typeof status === 'number' ? { httpStatus: status } : {}),
+    ...(cause === undefined ? {} : { cause: midsceneErrorDetails(cause, depth + 1) }),
+  };
+}
+
+async function runMidsceneCall<T>(
+  step: string,
+  timeoutMs: MidsceneTimeout,
+  page: Page,
+  runnerBrowser: Parameters<typeof createE2EBrowserAdapter>[0],
+  markerKey: string,
+  markerToken: string,
+  action: () => Promise<T>,
+): Promise<T> {
+  const startedAt = Date.now();
+  let midsceneUrl = '<unavailable>';
+  let runnerUrl = '<unavailable>';
+  try {
+    [midsceneUrl, runnerUrl] = await Promise.all([page.url(), runnerBrowser.url()]);
+    console.log(`[MIDSCENE_CALL] step=${step} timeoutMs=${timeoutMs} page.url=${JSON.stringify(midsceneUrl)} runner.page.url=${JSON.stringify(runnerUrl)}`);
+    if (midsceneUrl !== runnerUrl) throw new Error('MIDSCENE_PAGE_URL_MISMATCH');
+
+    const markerOnMidscenePage = await page.evaluate((key) => Reflect.get(window, key), markerKey);
+    const markerOnRunnerPage = await runnerBrowser.evaluate((key: string) => Reflect.get(window, key), markerKey);
+    if (markerOnMidscenePage !== markerToken || markerOnRunnerPage !== markerToken) {
+      throw new Error('MIDSCENE_PAGE_OBJECT_MISMATCH');
+    }
+    return await action();
+  } catch (error) {
+    console.error(`[MIDSCENE_STEP=${step}] error=${JSON.stringify(midsceneErrorDetails(error))}`);
+    throw error;
+  } finally {
+    console.log(`[MIDSCENE_CALL] step=${step} elapsedMs=${Date.now() - startedAt} timeoutMs=${timeoutMs} page.url=${JSON.stringify(midsceneUrl)} runner.page.url=${JSON.stringify(runnerUrl)}`);
   }
 }
 
@@ -81,6 +132,11 @@ test(
 
     let cdpBrowser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
     let midsceneAgent: PlaywrightPageAgent | undefined;
+    let midscenePage: Page | undefined;
+    let pageBindingSession: CDPSession | undefined;
+    let pageBindingScriptId: string | undefined;
+    let pageBindingKey: string | undefined;
+    let pageBindingToken: string | undefined;
     let balanceBefore: number | null = null;
     let balanceAfter: number | null = null;
     let midsceneBalance: number | null = null;
@@ -96,47 +152,62 @@ test(
         if (matchingPages.length !== 1) {
           throw new Error(`MIDSCENE_PAGE_BINDING_FAILED: expected exactly one page for runner URL; found ${matchingPages.length}`);
         }
-        midsceneAgent = new PlaywrightPageAgent(matchingPages[0], { cache: false });
+        midscenePage = matchingPages[0];
+        pageBindingKey = `__hbSlotRunnerBinding_${randomUUID().replaceAll('-', '')}`;
+        pageBindingToken = randomUUID();
+        pageBindingSession = await midscenePage.context().newCDPSession(midscenePage);
+        const injected = await pageBindingSession.send('Page.addScriptToEvaluateOnNewDocument', {
+          source: `Object.defineProperty(window, ${JSON.stringify(pageBindingKey)}, { value: ${JSON.stringify(pageBindingToken)}, configurable: true });`,
+        });
+        pageBindingScriptId = injected.identifier;
+        await midscenePage.evaluate((binding) => Object.defineProperty(window, binding.key, {
+          value: binding.token, configurable: true,
+        }), { key: pageBindingKey, token: pageBindingToken });
+
+        const attachPageUrl = await midscenePage.url();
+        const attachRunnerUrl = await browser.url();
+        const runnerMarker = await browser.evaluate((key: string) => Reflect.get(window, key), pageBindingKey);
+        console.log(`[MIDSCENE_BINDING] page.url=${JSON.stringify(attachPageUrl)} runner.page.url=${JSON.stringify(attachRunnerUrl)} samePageToken=${runnerMarker === pageBindingToken}`);
+        if (attachPageUrl !== attachRunnerUrl || runnerMarker !== pageBindingToken) {
+          throw new Error('MIDSCENE_PAGE_OBJECT_MISMATCH');
+        }
+
+        midsceneAgent = new PlaywrightPageAgent(midscenePage, { cache: false });
 
         // Runtime capability restriction: the adapter receives a new object with only
         // these three methods; the full agent is never passed across this boundary.
-        const trackFailure = (step: string, args: unknown[]) => {
-          const prompt = String(args[0] ?? '');
-          const spin = prompt.match(/spin number (\d+)/i);
-          midsceneFailure = { step, spin: spin ? Number(spin[1]) : step === 'stake assertion' ? 1 : null };
+        const invokeMidscene = <T>(step: string, spin: number | null, timeoutMs: MidsceneTimeout, action: () => Promise<T>) => {
+          return runMidsceneCall(step, timeoutMs, midscenePage!, browser, pageBindingKey!, pageBindingToken!, action)
+            .catch((error: unknown) => {
+              midsceneFailure = { step, spin };
+              throw error;
+            });
         };
         const readOnlyMidscene: ReadOnlyMidscene = {
-          aiWaitFor: async (...args) => {
-            try { return await midsceneAgent!.aiWaitFor(...args); }
-            catch (error) {
-              trackFailure(String(args[0]).includes('fully loaded') ? 'game readiness' : 'spin completion', args);
-              throw error;
-            }
+          aiWaitFor: (...args) => {
+            const prompt = String(args[0] ?? '');
+            const match = prompt.match(/spin number (\d+)/i);
+            const step = prompt.includes('fully loaded') ? 'game readiness' : 'spin completion';
+            const options = args[1] as { timeoutMs?: number } | undefined;
+            return invokeMidscene(step, match ? Number(match[1]) : null, options?.timeoutMs ?? 'Midscene default',
+              () => midsceneAgent!.aiWaitFor(...args));
           },
-          aiAssert: async (...args) => {
-            try { return await midsceneAgent!.aiAssert(...args); }
-            catch (error) {
-              trackFailure('stake assertion', args);
-              throw error;
-            }
+          aiAssert: (...args) => {
+            return invokeMidscene('stake assertion', 1, 'Midscene default', () => midsceneAgent!.aiAssert(...args));
           },
-          aiQuery: async (...args) => {
-            try { return await midsceneAgent!.aiQuery(...args); }
-            catch (error) {
-              trackFailure('balance fallback query', args);
-              throw error;
-            }
+          aiQuery: (...args) => {
+            return invokeMidscene('balance fallback query', null, 'Midscene default', () => midsceneAgent!.aiQuery(...args));
           },
         };
         return readOnlyMidscene;
       });
 
-      const balanceLocator = browser.locator('.account .balance-value').first();
+      const balanceLocator = browser.locator('[data-testid="left-menu-available-balance-formatted"]').first();
       const balanceBeforeText = await runPhase('Read header balance before opening the game', async () => {
         await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
         const value = await balanceLocator.textContent();
         balanceBefore = parseRand(value);
-        if (balanceBefore === null || balanceBefore < 0) throw new Error('HEADER_BALANCE_BEFORE_INVALID');
+        if (balanceBefore < 0) throw new Error('HEADER_BALANCE_BEFORE_INVALID');
         console.log(`Balance before (header): ${value?.trim() ?? ''} => R${balanceBefore.toFixed(2)}`);
         return value?.trim() ?? '';
       });
@@ -188,7 +259,7 @@ test(
         await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
         const value = (await balanceLocator.textContent())?.trim() ?? '';
         const headerBalanceAfter = parseRand(value);
-        console.log(`Balance after (header): ${value} => ${headerBalanceAfter === null ? 'unreadable' : `R${headerBalanceAfter.toFixed(2)}`}`);
+        console.log(`Balance after (header): ${value} => R${headerBalanceAfter.toFixed(2)}`);
 
         if (headerBalanceAfter === balanceBefore) {
           const visual = await midscene.aiQuery(
@@ -198,7 +269,7 @@ test(
             ? (visual as { balance: unknown }).balance
             : visual;
           midsceneBalance = parseRand(typeof visualValue === 'string' || typeof visualValue === 'number' ? visualValue : null);
-          console.log(`Balance fallback (Midscene): ${JSON.stringify(visual)} => ${midsceneBalance === null ? 'unreadable' : `R${midsceneBalance.toFixed(2)}`}`);
+          console.log(`Balance fallback (Midscene): ${JSON.stringify(visual)} => R${midsceneBalance.toFixed(2)}`);
           balanceAfter = midsceneBalance;
         } else {
           balanceAfter = headerBalanceAfter;
@@ -226,13 +297,19 @@ test(
       await saveReport(safeReport);
       console.log('Execution report:', JSON.stringify(safeReport, null, 2));
     } finally {
-      try {
-        await midsceneAgent?.destroy();
-      } finally {
-        // Closing a CDP-connected Playwright Browser disconnects this client only.
-        // Do not close the shared Edge browser, context, or runner page.
-        await cdpBrowser?.close();
+      if (pageBindingSession && pageBindingScriptId) {
+        await pageBindingSession.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: pageBindingScriptId }).catch(() => {});
       }
+      if (midscenePage && pageBindingKey) {
+        await midscenePage.evaluate((key) => Reflect.deleteProperty(window, key), pageBindingKey).catch(() => {});
+      }
+      await pageBindingSession?.detach().catch(() => {});
+      await midsceneAgent?.destroy().catch((error: unknown) => {
+        console.warn('MIDSCENE_CLEANUP_FAILED', JSON.stringify(midsceneErrorDetails(error)));
+      });
+      // Closing a CDP-connected Playwright Browser disconnects this client only.
+      // Do not close the shared Edge browser, context, or runner page.
+      await cdpBrowser?.close();
     }
   },
 );
