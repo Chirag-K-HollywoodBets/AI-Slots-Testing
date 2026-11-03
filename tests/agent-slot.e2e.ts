@@ -13,6 +13,7 @@ import { executePlan } from '../src/agent/executor';
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
 import { parseRand } from '../src/agent/slot-settlement';
+import { configureMidsceneModel, logMidsceneModelConfig } from '../src/agent/midscene-model';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
 const CDP_ENDPOINT = 'http://127.0.0.1:9223';
@@ -76,9 +77,12 @@ async function runMidsceneCall<T>(
 
     // The runner page may have navigated to a new document since attachment.
     // Restamp from the runner connection before Midscene reads the token.
-    await runnerBrowser.evaluate((binding) => Object.defineProperty(window, binding.key, {
-      value: binding.token, configurable: true,
-    }), { key: markerKey, token: markerToken });
+    await runnerBrowser.evaluate((binding) => {
+      Object.defineProperty(window, binding.key, {
+        value: binding.token, configurable: true,
+      });
+      return true;
+    }, { key: markerKey, token: markerToken });
 
     let markerOnMidscenePage: unknown;
     try {
@@ -152,6 +156,8 @@ test(
 
     try {
       const midscene = await runPhase('Attach read-only Midscene to the runner page', async () => {
+        const modelConfig = configureMidsceneModel();
+        logMidsceneModelConfig(modelConfig, process.env.MIDSCENE_MODEL_API_KEY);
         const runnerUrl = await browser.url();
         cdpBrowser = await chromium.connectOverCDP(CDP_ENDPOINT);
         const matchingPages = cdpBrowser.contexts()
@@ -163,9 +169,12 @@ test(
         midscenePage = matchingPages[0];
         pageBindingKey = `__hbSlotRunnerBinding_${randomUUID().replaceAll('-', '')}`;
         pageBindingToken = randomUUID();
-        await browser.evaluate((binding: { key: string; token: string }) => Object.defineProperty(window, binding.key, {
-          value: binding.token, configurable: true,
-        }), { key: pageBindingKey, token: pageBindingToken });
+        await browser.evaluate((binding: { key: string; token: string }) => {
+          Object.defineProperty(window, binding.key, {
+            value: binding.token, configurable: true,
+          });
+          return true;
+        }, { key: pageBindingKey, token: pageBindingToken });
 
         const attachPageUrl = await midscenePage.url();
         const attachRunnerUrl = await browser.url();

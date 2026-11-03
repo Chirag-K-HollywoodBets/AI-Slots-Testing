@@ -1,8 +1,10 @@
 import { PlaywrightPageAgent } from '@midscene/web/playwright';
 import { chromium, type Page, type Route } from 'playwright';
 import { readFile } from 'node:fs/promises';
+import { pathToFileURL } from 'node:url';
 import { ALLOWED_GAMES } from '../../src/agent/schema';
 import { isDoSpinRequest } from '../../src/agent/midscene-slot-guard';
+import { configureMidsceneModel } from '../../src/agent/midscene-model';
 
 const SITE_ORIGIN = 'https://www.hollywoodbets.net';
 const CDP_ENDPOINT = 'http://127.0.0.1:9223';
@@ -14,17 +16,8 @@ export function classifyMidsceneError(error: unknown): 'MODEL_UNAVAILABLE' | 'MO
   return 'MIDSCENE_INSPECTION_FAILED';
 }
 
-function configureMidsceneModel(): void {
-  // The Qwen vision adapter is the default for this image-based inspection;
-  // callers can override it when the configured model requires another family.
-  process.env.MIDSCENE_MODEL_BASE_URL ??= process.env.LLM_URL ?? 'http://10.6.49.95:8007/gemma/v1';
-  process.env.MIDSCENE_MODEL_NAME ??= process.env.LLM_MODEL ?? 'Qwen3.8-27B-GSQ-RCO-IQ3_XXS-mtp.gguf';
-  process.env.MIDSCENE_MODEL_FAMILY ??= 'qwen3-vl';
-  process.env.MIDSCENE_MODEL_API_KEY ??= process.env.LLM_API_KEY ?? 'dummy-key';
-}
-
 async function main(): Promise<void> {
-  configureMidsceneModel();
+  configureMidsceneModel(process.env, { allowLegacyLlmAliases: true });
   if (process.argv.includes('--check-model')) {
     const baseUrl = process.env.MIDSCENE_MODEL_BASE_URL;
     const model = process.env.MIDSCENE_MODEL_NAME;
@@ -97,8 +90,10 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  const code = classifyMidsceneError(error);
-  console.log('MIDSCENE_RESULT:' + JSON.stringify({ status: code, success: false, mode: 'SLOTS_INSPECT', error: code, logs: message.slice(0, 2000) }));
-});
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  main().catch((error: unknown) => {
+    const message = error instanceof Error ? error.message : String(error);
+    const code = classifyMidsceneError(error);
+    console.log('MIDSCENE_RESULT:' + JSON.stringify({ status: code, success: false, mode: 'SLOTS_INSPECT', error: code, logs: message.slice(0, 2000) }));
+  });
+}
