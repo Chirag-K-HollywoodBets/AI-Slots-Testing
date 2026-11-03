@@ -47,7 +47,14 @@ A ready slip requires an exact readable stake and a valid displayed payout. For 
 node chat/server.cjs
 ```
 
-Open [http://127.0.0.1:3001](http://127.0.0.1:3001), send `Log in, open Games in Olympus and play 10 spins at R0.20`, review the canonical game, spin count, stake per spin, and maximum total stake, then select **Confirm and run**. The game must already remember R0.20 with ante off; unsupported remembered stakes stop before the first spin.
+Sports plans use the **Sportsbook** execution mode. Slot wagering requires the separate **Slots play** mode; a slot plan submitted in Sportsbook mode is rejected. Slots play is off by default. To enable it for a server session, set the exact opt-in flag in PowerShell before starting the chat server:
+
+```powershell
+$env:ENABLE_SLOTS_PLAY = "1"
+node chat/server.cjs
+```
+
+Only the exact value `1` enables the mode; unset, empty, `0`, and `true` leave it disabled. Open [http://127.0.0.1:3001](http://127.0.0.1:3001), select **Slots play**, send `Log in, open Games in Olympus and play 10 spins at R0.20`, review the canonical game, spin count, stake per spin, and maximum total stake, then select **Confirm and run**. The chat still requires explicit human confirmation before the runner starts. The game must already remember R0.20 with ante off; unsupported remembered stakes stop before the first spin.
 
 Sports requests collect every team, opponent, competition, market and one exact total stake before confirmation. Missing details are asked for across replies; they are never defaulted. Amounts from R1.00 through R50.00 in one-cent increments pass stake validation. The app caps accumulators at 10 selections. For the supplied two-leg example, (3.00 + 1) × (1.95 + 1) − 1 = 10.80 base odds; an observed 2.5% bonus yields 11.07 final odds and R110.70 payout on R10. The bonus is never assumed. The single-slip rule remains **0.65 × R10 = R6.50 payout**, without adding stake or labelling profit. The chat provides Submit R{stake} bet and Finish without submitting. Accumulator submission remains disabled while the bonus/final-odds/payout evidence is unreadable. Single submission is available only with explicit opt-in runner configuration and a live verified slip; missing receipt evidence means acceptance is unverified. Mocked tests never place a live bet.
 

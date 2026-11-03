@@ -26,6 +26,27 @@ const complete: SportsInterpretation = { kind: 'new_request', updates: {
   competition: quote('Premier League'), market: quote('to beat'), totalStake: quote('R10'),
 } };
 const completeMessage = 'Prepare R10 Premier League Arsenal to beat Chelsea. Do not submit.';
+const slotInstruction = 'Log in, open Games in Olympus and play 1 spin at R0.20';
+
+function plannedSlot() {
+  return {
+    status: 'PLANNED', auth: true, wager: true,
+    plan: { thought: 'Open the supported slot and play the confirmed spin count.', actions: [
+      { type: 'open_game', game: 'games-in-olympus' },
+      { type: 'play_slot', game: 'games-in-olympus', spins: 1, stake: 0.2 },
+    ] },
+  };
+}
+
+function plannedSports() {
+  return {
+    status: 'PLANNED', auth: true, wager: true,
+    plan: { thought: 'Prepare the specified sports selection.', actions: [
+      { type: 'prepare_sports_bet', competition: 'premier-league',
+        selections: [{ team: 'Arsenal', opponent: 'Chelsea' }], market: 'match-winner', stakeCents: 1000, submit: false },
+    ] },
+  };
+}
 
 describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   let server: Server;
@@ -41,8 +62,11 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   const verifySubmissionEvidence = vi.fn(() => true);
   let submissionEnabled = false;
   let activeReview: any;
+  let previousSlotsPlayFlag: string | undefined;
 
   beforeEach(async () => {
+    previousSlotsPlayFlag = process.env.ENABLE_SLOTS_PLAY;
+    delete process.env.ENABLE_SLOTS_PLAY;
     vi.resetAllMocks();
     submissionEnabled = false;
     activeReview = null;
@@ -59,8 +83,13 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     base = `http://127.0.0.1:${address.port}`;
   });
   afterEach(async () => {
-    server.closeAllConnections();
-    await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    try {
+      server.closeAllConnections();
+      await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    } finally {
+      if (previousSlotsPlayFlag === undefined) delete process.env.ENABLE_SLOTS_PLAY;
+      else process.env.ENABLE_SLOTS_PLAY = previousSlotsPlayFlag;
+    }
   });
   async function session(): Promise<string> {
     const response = await fetch(base);
@@ -89,9 +118,8 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     expect(inspectSlots).not.toHaveBeenCalled();
     expect(runPlan).not.toHaveBeenCalled();
   });
-  it('rejects disabled and malformed execution modes before planning', async () => {
+  it('rejects malformed execution modes before planning', async () => {
     const cookie = await session();
-    expect((await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: 'Inspect' })).result.code).toBe('MODE_DISABLED');
     expect((await post(cookie, '/api/run', { mode: 'SLOTS_INSPECT' })).code).toBe(400);
     expect((await post(cookie, '/api/run', { mode: 'BYPASS', instruction: 'Inspect' })).result.code).toBe('INVALID_MODE');
     expect(planMessage).not.toHaveBeenCalled();
@@ -192,7 +220,7 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     expect(prepareReview).not.toHaveBeenCalled();
   });
 
-  it('disables slot play without disturbing the separate sports draft', async () => {
+  it('SLOTS_PLAY disabled unless ENABLE_SLOTS_PLAY=1', async () => {
     const cookie = await session();
     interpretOnce({ kind: 'new_request', updates: {} });
     await post(cookie, '/api/run', { instruction: 'Prepare a soccer bet' });
@@ -202,9 +230,21 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
       prepareReview: prepareReview.mock.calls.length,
       runPlan: runPlan.mock.calls.length,
     };
-    const slot = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: 'Log in, open Games in Olympus and play 10 spins at R0.20' });
-    expect(slot.code).toBe(403);
-    expect(slot.result.status).toBe('MODE_DISABLED');
+
+    for (const value of ['true', '0', '']) {
+      process.env.ENABLE_SLOTS_PLAY = value;
+      const html = await fetch(base, { headers: { cookie } }).then((response) => response.text());
+      expect(html).toContain('Slots play (disabled)');
+      const slot = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: slotInstruction });
+      expect(slot.code).toBe(403);
+      expect(slot.result.code).toBe('MODE_DISABLED');
+    }
+
+    delete process.env.ENABLE_SLOTS_PLAY;
+    const unsetHtml = await fetch(base, { headers: { cookie } }).then((response) => response.text());
+    expect(unsetHtml).toContain('Slots play (disabled)');
+    const unset = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: slotInstruction });
+    expect(unset.result.code).toBe('MODE_DISABLED');
     expect(planMessage).toHaveBeenCalledTimes(callsBeforeDisabledPlay.planMessage);
     expect(inspectSlots).toHaveBeenCalledTimes(callsBeforeDisabledPlay.inspectSlots);
     expect(prepareReview).toHaveBeenCalledTimes(callsBeforeDisabledPlay.prepareReview);
@@ -214,6 +254,70 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     await post(cookie, '/api/run', { instruction: 'hello' });
     expect(planMessage).toHaveBeenCalledTimes(plannerCallsBeforeSportsFollowUp + 1);
     expect(planMessage.mock.calls.at(-1)?.[1]).not.toBeNull();
+  });
+
+  it('rejects a slot plan submitted in SPORTS mode before creating a confirmation', async () => {
+    process.env.ENABLE_SLOTS_PLAY = '1';
+    const cookie = await session();
+    const planned = plannedSlot();
+    planMessage.mockResolvedValueOnce(planned);
+
+    const response = await post(cookie, '/api/run', { mode: 'SPORTS', instruction: slotInstruction });
+
+    expect(response.code).toBe(403);
+    expect(response.result.code).toBe('MODE_PLAN_MISMATCH');
+    expect(runPlan).not.toHaveBeenCalled();
+    expect((await fetch(base + '/api/conversation-state', { headers: { cookie } }).then((r) => r.json()))
+      .conversation.confirmations).toEqual([]);
+  });
+
+  it('rejects a sports plan submitted in SLOTS_PLAY mode', async () => {
+    process.env.ENABLE_SLOTS_PLAY = '1';
+    const cookie = await session();
+    planMessage.mockResolvedValueOnce(plannedSports());
+
+    const response = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: 'Prepare Arsenal vs Chelsea' });
+
+    expect(response.code).toBe(403);
+    expect(response.result.code).toBe('MODE_PLAN_MISMATCH');
+    expect(runPlan).not.toHaveBeenCalled();
+  });
+
+  it('rechecks the stored plan mode at /api/confirm before dispatch', async () => {
+    process.env.ENABLE_SLOTS_PLAY = '1';
+    const cookie = await session();
+    const planned = plannedSlot();
+    planMessage.mockResolvedValueOnce(planned);
+
+    const ready = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: slotInstruction });
+    expect(ready.result.status).toBe('CONFIRM');
+
+    // Simulate a stored-plan change after confirmation; confirmation must derive
+    // its mode from the stored action types again instead of dispatching it.
+    (planned.plan as { actions: unknown[] }).actions = plannedSports().plan.actions;
+    const confirmed = await post(cookie, '/api/confirm', { planId: ready.result.planId });
+
+    expect(confirmed.code).toBe(403);
+    expect(confirmed.result.code).toBe('MODE_PLAN_MISMATCH');
+    expect(runPlan).not.toHaveBeenCalled();
+  });
+
+  it('enabled SLOTS_PLAY presents a one-spin R0.20 Games in Olympus confirmation', async () => {
+    process.env.ENABLE_SLOTS_PLAY = '1';
+    const cookie = await session();
+    planMessage.mockResolvedValueOnce(plannedSlot());
+
+    const html = await fetch(base, { headers: { cookie } }).then((response) => response.text());
+    const response = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: slotInstruction });
+
+    expect(html).toContain('<option value="SLOTS_PLAY">Slots play</option>');
+    expect(html).not.toContain('Slots play (disabled)');
+    expect(response.result.status).toBe('CONFIRM');
+    expect(response.result.actions).toContainEqual({ type: 'play_slot', game: 'games-in-olympus', spins: 1, stake: 0.2 });
+    expect(response.result.summary).toContain('Games in Olympus');
+    expect(response.result.summary).toContain('1 spin');
+    expect(response.result.summary).toContain('R0.20');
+    expect(runPlan).not.toHaveBeenCalled();
   });
 
   it('blocks an unexpected legacy sports plan that has not passed the conversation contract', async () => {

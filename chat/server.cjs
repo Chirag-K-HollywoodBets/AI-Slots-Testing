@@ -61,6 +61,19 @@ const READ_ONLY_TEST = 'tests/agent-ai-demo.e2e.ts';
 const SLOT_TEST = 'tests/agent-slot.e2e.ts';
 const SPORTS_TEST = 'tests/agent-sports.e2e.ts';
 const EXECUTION_MODES = ['SPORTS', 'SLOTS_INSPECT', 'SLOTS_PLAY'];
+const slotsPlayEnabled = () => process.env.ENABLE_SLOTS_PLAY === '1';
+
+// Plan mode comes from the validated action discriminator fields, never from
+// the free-text request. A mixed slot/sports plan is invalid in either mode.
+function planModeMismatch(mode, plan) {
+  const actions = Array.isArray(plan?.actions) ? plan.actions : [];
+  const hasSlotAction = actions.some((action) => action?.type === 'open_game' || action?.type === 'play_slot');
+  const hasSportsAction = actions.some((action) => action?.type === 'prepare_sports_bet');
+  return (hasSlotAction && hasSportsAction)
+    || (hasSlotAction && mode !== 'SLOTS_PLAY')
+    || (hasSportsAction && mode !== 'SPORTS');
+}
+
 let inspectionBusy = false;
 async function runMidsceneInspection(instruction) {
   const startedAt = Date.now();
@@ -84,7 +97,8 @@ async function runMidsceneInspection(instruction) {
   } finally { await rm(directory, { recursive: true, force: true }); }
 }
 
-const html = `<!DOCTYPE html>
+function renderHtml() {
+return `<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
@@ -148,7 +162,7 @@ button:disabled { opacity: .5; }
 <p id="conversation-status" role="status" aria-live="polite">Ready for your request</p>
 <div id="messages" role="log" aria-label="Conversation" aria-live="polite"></div>
 <form id="form">
-<select id="mode" aria-label="Execution mode"><option value="SLOTS_INSPECT">Slots inspection</option><option value="SPORTS">Sportsbook</option><option value="SLOTS_PLAY">Slots play (disabled)</option></select>
+<select id="mode" aria-label="Execution mode"><option value="SLOTS_INSPECT">Slots inspection</option><option value="SPORTS">Sportsbook</option><option value="SLOTS_PLAY">Slots play${slotsPlayEnabled() ? '' : ' (disabled)'}</option></select>
 <input id="instruction"
  maxlength="500"
  placeholder="Describe a request or answer a question..."
@@ -159,6 +173,7 @@ button:disabled { opacity: .5; }
 <script src="/client.js" defer></script>
 </body>
 </html>`;
+}
 
 function sendJson(res, status, data) {
   res.writeHead(status, {
@@ -541,7 +556,7 @@ return http.createServer(async (req, res) => {
       'Content-Security-Policy':
         "default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'"
     });
-    return res.end(html);
+    return res.end(renderHtml());
   }
 
   const route = requestUrl.pathname;
@@ -735,12 +750,15 @@ return http.createServer(async (req, res) => {
       : sendJson(res, 400, { error: 'Invalid JSON' });
   }
 
+  let selectedMode;
   if (route === '/api/run') {
     // Legacy API clients without a mode retain the historical SPORTS flow.
     // Slot work always requires an explicit mode; there is no implicit play permission.
     const mode = payload.mode === undefined ? 'SPORTS' : payload.mode;
+    selectedMode = mode;
     if (!EXECUTION_MODES.includes(mode)) return sendJson(res, 400, { status: 'INVALID_MODE', code: 'INVALID_MODE', error: 'Select SPORTS or SLOTS_INSPECT.' });
-    if (mode === 'SLOTS_PLAY') return sendJson(res, 403, { status: 'MODE_DISABLED', code: 'MODE_DISABLED', success: false, error: 'SLOTS_PLAY is disabled.' });
+    if (mode === 'SLOTS_PLAY' && !slotsPlayEnabled()) return sendJson(res, 403, { status: 'MODE_DISABLED', code: 'MODE_DISABLED', success: false,
+      error: 'SLOTS_PLAY is disabled. Set ENABLE_SLOTS_PLAY=1 when starting the chat server to enable it.' });
     if (typeof payload.instruction !== 'string' || !payload.instruction.trim() || payload.instruction.length > 500)
       return sendJson(res, 400, { status: 'INVALID_REQUEST', code: 'INVALID_REQUEST', error: 'Invalid instruction' });
     if (mode === 'SLOTS_INSPECT') {
@@ -768,6 +786,15 @@ return http.createServer(async (req, res) => {
       const pending = takeConfirmation(session, payload.planId);
       if (!pending) {
         return sendJson(res, 400, { code: 'PLAN_EXPIRED', error: 'Plan expired, already used, or unknown. Start with “New request: …” for a fresh summary.' });
+      }
+
+      if (pending.mode === 'SLOTS_PLAY' && !slotsPlayEnabled()) {
+        return sendJson(res, 403, { status: 'MODE_DISABLED', code: 'MODE_DISABLED', success: false,
+          error: 'SLOTS_PLAY is disabled. Set ENABLE_SLOTS_PLAY=1 when starting the chat server to enable it.' });
+      }
+      if (planModeMismatch(pending.mode, pending.plan)) {
+        return sendJson(res, 403, { status: 'MODE_PLAN_MISMATCH', code: 'MODE_PLAN_MISMATCH', success: false,
+          error: 'The stored execution mode does not match the validated plan type.' });
       }
 
       const isSports = pending.plan.actions.some((action) => action.type === 'prepare_sports_bet');
@@ -839,6 +866,11 @@ return http.createServer(async (req, res) => {
       throw new Error(result.code || 'PLANNING_FAILED');
     }
 
+    if (planModeMismatch(selectedMode, result.plan)) {
+      return sendJson(res, 403, { status: 'MODE_PLAN_MISMATCH', code: 'MODE_PLAN_MISMATCH', success: false,
+        error: 'The selected execution mode does not match the validated plan type.' });
+    }
+
     const sportsAction = result.plan.actions.find((action) => action.type === 'prepare_sports_bet');
     if (sportsAction && (result.auth !== true || !result.pendingSports || !sportsPlanMatchesRequest(result.plan, result.conversationState)
       || sportsRequestFingerprint(result.pendingSports) !== sportsRequestFingerprint(result.conversationState.request)
@@ -855,6 +887,7 @@ return http.createServer(async (req, res) => {
       const planId = randomUUID();
       session.confirmations.set(planId, {
         ...pendingPlan(result.plan, result.usage, result.conversationState?.confirmation?.expiresAt ?? Date.now() + CONFIRM_WINDOW_MS),
+        mode: selectedMode,
         ...(sportsAction && result.conversationState ? { sportsRevision: result.conversationState.revision,
           sportsRequestFingerprint: sportsRequestFingerprint(result.pendingSports) } : {}),
       });
