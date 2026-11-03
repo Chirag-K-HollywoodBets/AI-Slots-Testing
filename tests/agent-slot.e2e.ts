@@ -4,7 +4,7 @@
 import { test } from '@e2e-dev/web';
 import { expect } from 'e2e';
 import { randomUUID } from 'node:crypto';
-import { chromium, type CDPSession, type Page } from 'playwright';
+import { chromium, type Page } from 'playwright';
 import { PlaywrightPageAgent } from '@midscene/web/playwright';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
@@ -74,6 +74,12 @@ async function runMidsceneCall<T>(
     console.log(`[MIDSCENE_CALL] step=${step} timeoutMs=${timeoutMs} page.url=${JSON.stringify(midsceneUrl)} runner.page.url=${JSON.stringify(runnerUrl)}`);
     if (midsceneUrl !== runnerUrl) throw new Error('MIDSCENE_PAGE_URL_MISMATCH');
 
+    // The runner page may have navigated to a new document since attachment.
+    // Restamp from the runner connection before Midscene reads the token.
+    await runnerBrowser.evaluate((binding) => Object.defineProperty(window, binding.key, {
+      value: binding.token, configurable: true,
+    }), { key: markerKey, token: markerToken });
+
     let markerOnMidscenePage: unknown;
     try {
       markerOnMidscenePage = await page.evaluate((key) => Reflect.get(window, key), markerKey);
@@ -137,8 +143,6 @@ test(
     let cdpBrowser: Awaited<ReturnType<typeof chromium.connectOverCDP>> | undefined;
     let midsceneAgent: PlaywrightPageAgent | undefined;
     let midscenePage: Page | undefined;
-    let pageBindingSession: CDPSession | undefined;
-    let pageBindingScriptId: string | undefined;
     let pageBindingKey: string | undefined;
     let pageBindingToken: string | undefined;
     let balanceBefore: number | null = null;
@@ -159,20 +163,15 @@ test(
         midscenePage = matchingPages[0];
         pageBindingKey = `__hbSlotRunnerBinding_${randomUUID().replaceAll('-', '')}`;
         pageBindingToken = randomUUID();
-        pageBindingSession = await midscenePage.context().newCDPSession(midscenePage);
-        const injected = await pageBindingSession.send('Page.addScriptToEvaluateOnNewDocument', {
-          source: `Object.defineProperty(window, ${JSON.stringify(pageBindingKey)}, { value: ${JSON.stringify(pageBindingToken)}, configurable: true });`,
-        });
-        pageBindingScriptId = injected.identifier;
-        await midscenePage.evaluate((binding) => Object.defineProperty(window, binding.key, {
+        await browser.evaluate((binding: { key: string; token: string }) => Object.defineProperty(window, binding.key, {
           value: binding.token, configurable: true,
         }), { key: pageBindingKey, token: pageBindingToken });
 
         const attachPageUrl = await midscenePage.url();
         const attachRunnerUrl = await browser.url();
-        const runnerMarker = await browser.evaluate((key: string) => Reflect.get(window, key), pageBindingKey);
-        console.log(`[MIDSCENE_BINDING] page.url=${JSON.stringify(attachPageUrl)} runner.page.url=${JSON.stringify(attachRunnerUrl)} samePageToken=${runnerMarker === pageBindingToken}`);
-        if (attachPageUrl !== attachRunnerUrl || runnerMarker !== pageBindingToken) {
+        const midsceneMarker = await midscenePage.evaluate((key) => Reflect.get(window, key), pageBindingKey);
+        console.log(`[MIDSCENE_BINDING] page.url=${JSON.stringify(attachPageUrl)} runner.page.url=${JSON.stringify(attachRunnerUrl)} samePageToken=${midsceneMarker === pageBindingToken}`);
+        if (attachPageUrl !== attachRunnerUrl || midsceneMarker !== pageBindingToken) {
           throw new Error('MIDSCENE_PAGE_OBJECT_MISMATCH');
         }
 
@@ -301,13 +300,9 @@ test(
       await saveReport(safeReport);
       console.log('Execution report:', JSON.stringify(safeReport, null, 2));
     } finally {
-      if (pageBindingSession && pageBindingScriptId) {
-        await pageBindingSession.send('Page.removeScriptToEvaluateOnNewDocument', { identifier: pageBindingScriptId }).catch(() => {});
+      if (pageBindingKey) {
+        await browser.evaluate((key: string) => Reflect.deleteProperty(window, key), pageBindingKey).catch(() => {});
       }
-      if (midscenePage && pageBindingKey) {
-        await midscenePage.evaluate((key) => Reflect.deleteProperty(window, key), pageBindingKey).catch(() => {});
-      }
-      await pageBindingSession?.detach().catch(() => {});
       await midsceneAgent?.destroy().catch((error: unknown) => {
         console.warn('MIDSCENE_CLEANUP_FAILED', JSON.stringify(midsceneErrorDetails(error)));
       });
