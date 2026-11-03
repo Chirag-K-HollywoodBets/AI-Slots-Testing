@@ -4,6 +4,7 @@ import { SportsPreparationError, verifySportsAmounts, type SlipSelection } from 
 import { waitForBetslip } from '../sports-readiness';
 import type { Screen } from 'e2e';
 import { expect } from 'e2e';
+import type { PlaywrightPageAgent } from '@midscene/web/playwright';
 import {
   ALLOWED_GAMES,
   ALLOWED_PATHS,
@@ -59,6 +60,11 @@ const SPIN_BUTTON = {
 // finished once no new response arrives for this long.
 const QUIET_MS = 4000;
 const FIRST_RESPONSE_TIMEOUT_MS = 30000;
+const MIDSCENE_GAME_READY_TIMEOUT_MS = 120000;
+const MIDSCENE_SPIN_FINISH_TIMEOUT_MS = 120000;
+
+/** The runner receives only these read-only Midscene operations. */
+export type ReadOnlyMidscene = Pick<PlaywrightPageAgent, 'aiWaitFor' | 'aiAssert' | 'aiQuery'>;
  
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -192,7 +198,8 @@ export function createE2EBrowserAdapter(
   browser: Browser,
   app: { open(path: string): Promise<unknown> },
   allowedOrigin: string,
-  screen: Screen
+  screen: Screen,
+  midscene?: ReadOnlyMidscene,
 ): BrowserAdapter {
   const origin = new URL(allowedOrigin).origin;
  
@@ -332,6 +339,7 @@ export function createE2EBrowserAdapter(
     },
  
     async openGame(game: string) {
+      if (!midscene) throw new Error('MIDSCENE_SLOT_READER_REQUIRED');
       const gameUrl = getSlotGameUrl(game, origin);
 
       // Install the doSpin guard before loading the game. It blocks every spin
@@ -398,12 +406,23 @@ export function createE2EBrowserAdapter(
         nextAction: gameState.nextAction,
       }));
  
-      // Give the game's own loading screen time to finish before any input.
-      await new Promise((r) => setTimeout(r, 15000));
+      // Wait for the canvas game to be ready using Midscene's read-only APIs.
+      try {
+        await midscene.aiWaitFor(
+          'Games in Olympus is fully loaded in the game canvas, the reels are visible, and the spin button is visible.',
+          { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
+        );
+      } catch {
+        console.error('MIDSCENE_STEP=game readiness FAILED');
+        await browser.unroute(GAME_SERVICE);
+        slotGuard = null;
+        throw new Error('MIDSCENE_GAME_READY_FAILED');
+      }
       return { frameSrc: rect.host };
     },
  
     async playSlot(game: string, spins: number, stake: number) {
+      if (!midscene) throw new SlotRunError('MIDSCENE_SLOT_READER_REQUIRED', 0, 0);
       // Re-check limits here too: the adapter must never trust its caller.
       guardSlotAction({ type: 'spin', spins });
       guardSlotAction({ type: 'wager', wager: stake });
@@ -432,6 +451,20 @@ export function createE2EBrowserAdapter(
         await browser.unroute(GAME_SERVICE);
         slotGuard = null;
         throw new SlotRunError('BET_NOT_AT_STAKE', 0, 0);
+      }
+
+      if (stake !== 0.2) {
+        await browser.unroute(GAME_SERVICE);
+        slotGuard = null;
+        throw new SlotRunError('STAKE_NOT_R020', 0, 0);
+      }
+      try {
+        await midscene.aiAssert('The stake displayed in the game canvas is exactly R0.20 and ante bet is off.');
+      } catch {
+        console.error('MIDSCENE_STEP=stake assertion spin=1 FAILED');
+        await browser.unroute(GAME_SERVICE);
+        slotGuard = null;
+        throw new SlotRunError('MIDSCENE_STAKE_ASSERT_FAILED', 0, 0);
       }
  
       // Network guard: every doSpin request is checked before it leaves the browser.
@@ -512,6 +545,16 @@ export function createE2EBrowserAdapter(
               console.log(`BALANCE CHECK spin ${i + 1}: expected ${expected}, got ${balance}`);
               throw new Error('BALANCE_MISMATCH');
             }
+          }
+
+          try {
+            await midscene.aiWaitFor(
+              `Spin number ${i + 1} is finished: all reels have stopped and the spin button is visible and active again.`,
+              { timeoutMs: MIDSCENE_SPIN_FINISH_TIMEOUT_MS, checkIntervalMs: 1500 },
+            );
+          } catch {
+            console.error(`MIDSCENE_STEP=spin completion spin=${i + 1} FAILED`);
+            throw new Error('MIDSCENE_SPIN_FINISH_FAILED');
           }
  
           results.push({ stake: first.stake, win, balance });
