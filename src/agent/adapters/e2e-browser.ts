@@ -667,6 +667,24 @@ export function createE2EBrowserAdapter(
           }
           throw failOverlay(`Prize Drops remained after dismissal: ${JSON.stringify(state)}`);
         };
+
+        const runPreSpinReadiness = async (spinNumber: number): Promise<void> => {
+          try {
+            await midscene.aiWaitFor(
+              GAME_READINESS_PROMPT,
+              { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
+            );
+          } catch (error) {
+            throw new SlotRunError('GAME_NOT_READY', results.length, guard?.sent ?? 0, spinResponses.count,
+              results, `pre-spin-${spinNumber}`, requestGuardCounts, settlementEvents, error);
+          }
+          try {
+            await midscene.aiAssert(STAKE_READINESS_PROMPT);
+          } catch (error) {
+            throw new SlotRunError('MIDSCENE_STAKE_ASSERT_FAILED', results.length, guard?.sent ?? 0, spinResponses.count,
+              results, `pre-spin-${spinNumber}`, requestGuardCounts, settlementEvents, error);
+          }
+        };
  
         for (let i = 0; i < spins; i++) {
           currentSpinNumber = i + 1;
@@ -680,11 +698,7 @@ export function createE2EBrowserAdapter(
           if (stake !== 0.2 || gameState.stake !== stake || gameState.anteOn !== false) throw new Error('STAKE_MISMATCH');
           if (guard.blocked) throw new Error(guard.blocked);
           await clearBlockingOverlay(i + 1);
-          await midscene.aiWaitFor(
-            GAME_READINESS_PROMPT,
-            { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
-          );
-          await midscene.aiAssert(STAKE_READINESS_PROMPT);
+          await runPreSpinReadiness(i + 1);
           const preSpinGuard = requestGuardCounts.at(-1)!;
           preSpinGuard.requestsSeen = guard.requests - currentSpinRequestStart;
           preSpinGuard.requestsSent = guard.sent - (results.at(-1)?.doSpinRequestsSent ?? 0);
@@ -728,11 +742,7 @@ export function createE2EBrowserAdapter(
               if (clickAttempt > 0) throw error;
               console.log(`SPIN ${i + 1} NO REQUEST: rechecking overlay, readiness and stake before its single retry`);
               await clearBlockingOverlay(i + 1);
-              await midscene.aiWaitFor(
-                GAME_READINESS_PROMPT,
-                { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
-              );
-              await midscene.aiAssert(STAKE_READINESS_PROMPT);
+              await runPreSpinReadiness(i + 1);
               if (guard.requests !== requestStart) throw new Error('SPIN_OUTCOME_UNKNOWN');
               if (!canRetrySpin(requestsForSpin, clickAttempt, true, true)) throw error;
             } finally {
@@ -749,7 +759,7 @@ export function createE2EBrowserAdapter(
           const stakeFailure = spinStakeFailureCode(first, stake);
           if (stakeFailure || first.stake === null) throw new Error(stakeFailure ?? 'STAKE_MISMATCH');
  
-          // The first response carrying the server stake is the authoritative doSpin settlement.
+          // Win and balance come from the last responses that carry those fields.
           const win = extracted.win;
           const balance = extracted.balance;
  

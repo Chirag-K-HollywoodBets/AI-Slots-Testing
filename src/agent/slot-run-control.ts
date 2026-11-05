@@ -38,6 +38,7 @@ export function collectResponseQuietWindow<T>(
     let firstTimer: ReturnType<typeof setTimeout> | undefined;
     let quietTimer: ReturnType<typeof setTimeout> | undefined;
     let processing = Promise.resolve();
+    let triggerPromise: Promise<void> | undefined;
     let unsubscribe: () => void = () => undefined;
     const cleanup = () => {
       if (firstTimer) clearTimeout(firstTimer);
@@ -48,12 +49,16 @@ export function collectResponseQuietWindow<T>(
       if (done) return;
       done = true;
       cleanup();
-      reject(error);
+      void (async () => {
+        if (triggerPromise) await Promise.allSettled([triggerPromise]);
+        reject(error);
+      })();
     };
     const finish = async (timedOut: boolean) => {
       if (done) return;
       done = true;
       cleanup();
+      if (triggerPromise) await Promise.allSettled([triggerPromise]);
       try {
         await processing;
         resolve({ responseCount, timedOut: timedOut && responseCount === 0, ...(triggerError === undefined ? {} : { triggerError }) });
@@ -74,7 +79,8 @@ export function collectResponseQuietWindow<T>(
     try {
       unsubscribe = subscribe(onEvent);
       firstTimer = setTimeout(() => { void finish(true); }, options.firstResponseTimeoutMs);
-      void trigger().catch((error: unknown) => { triggerError = error; });
+      triggerPromise = Promise.resolve().then(trigger);
+      void triggerPromise.catch((error: unknown) => { triggerError = error; });
     } catch (error) {
       fail(error);
     }

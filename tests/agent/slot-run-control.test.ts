@@ -31,6 +31,23 @@ describe('slot run controls', () => {
     expect(spinCollectionFailureCode(result.responseCount, 1)).toBeNull();
   });
 
+  it('waits for a slow trigger to settle after the quiet timer before returning', async () => {
+    let publish: ((response: string) => void) | undefined;
+    let triggerSettled = false;
+    const result = await collectResponseQuietWindow<string>(
+      (listener) => { publish = listener; return () => { publish = undefined; }; },
+      async () => {
+        publish?.('doSpin');
+        await new Promise<void>((resolve) => setTimeout(resolve, 20));
+        triggerSettled = true;
+      },
+      async () => undefined,
+      { firstResponseTimeoutMs: 100, quietMs: 1 },
+    );
+    expect(result).toMatchObject({ responseCount: 1, timedOut: false });
+    expect(triggerSettled).toBe(true);
+  });
+
   it('extracts and persists the one losing-spin response', () => {
     const response = parseGameResponse('action=doSpin&c=0.01&l=20&bl=0&tw=0.00&balance=99.80');
     const events: Array<{ spin: number; responseIndex: number; serverFields: typeof response.serverFields }> = [];
