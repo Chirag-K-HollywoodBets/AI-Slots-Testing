@@ -83,6 +83,7 @@ export function collectResponseQuietWindow<T>(
 
 export interface SpinSettlementResponse {
   stake: number | null;
+  anteOn: boolean | null;
   win: number | null;
   balance: number | null;
   serverFields: { c: number | null; l: number | null; tw: number | null; balance: number | null };
@@ -99,7 +100,13 @@ export function extractSpinSettlement(responses: SpinSettlementResponse[]) {
   };
 }
 
-export interface WinCelebrationState { overlay: string; blocksSpin: boolean }
+export function spinStakeFailureCode(response: SpinSettlementResponse, expectedStake: number): 'STAKE_MISMATCH' | null {
+  return response.stake !== expectedStake || response.anteOn !== false ? 'STAKE_MISMATCH' : null;
+}
+
+export type SlotOverlayType = 'none' | 'win_celebration' | 'prize_drops' | 'free_spins' | 'other';
+
+export interface WinCelebrationState { overlay: SlotOverlayType; blocksSpin: boolean }
 
 /** Passive-only polling for a win animation; this helper has no click capability. */
 export async function waitForWinCelebrationClear(

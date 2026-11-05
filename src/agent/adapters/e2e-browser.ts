@@ -36,7 +36,7 @@ import {
   SlotSpinResponseCounter,
 } from '../slot-safety';
 import { getSlotGameUrl, navigateToSlotGameUrl } from '../slot-navigation';
-import { canRetrySpin, collectResponseQuietWindow, decidePreSpinOverlay, extractSpinSettlement, persistSpinSettlement, spinBalanceMatches, spinCollectionFailureCode, waitForWinCelebrationClear, winCelebrationFailureCode } from '../slot-run-control';
+import { canRetrySpin, collectResponseQuietWindow, decidePreSpinOverlay, extractSpinSettlement, persistSpinSettlement, spinBalanceMatches, spinCollectionFailureCode, spinStakeFailureCode, waitForWinCelebrationClear, winCelebrationFailureCode, type SlotOverlayType } from '../slot-run-control';
  
 // ---- Slot settings ----
  
@@ -181,7 +181,7 @@ export async function removeSportsSubmitGuard(browser: Browser): Promise<void> {
 interface GameResponse {
   balance: number | null;
   stake: number | null;
-  anteOn: boolean;
+  anteOn: boolean | null;
   win: number | null;
   nextAction: string | null;
   freeSpins: boolean;
@@ -189,7 +189,7 @@ interface GameResponse {
 }
 
 interface SlotOverlayState {
-  overlay: 'none' | 'win_celebration' | 'prize_drops' | 'free_spins' | 'other';
+  overlay: SlotOverlayType;
   blocksSpin: boolean;
 }
 
@@ -218,7 +218,7 @@ export function parseGameResponse(body: string): GameResponse {
   return {
     balance: num('balance'),
     stake: c !== null && l !== null ? round2(c * l) : null,
-    anteOn: !p.has('bl') || p.get('bl') !== '0',
+    anteOn: p.get('bl') === '0' ? false : p.get('bl') === '1' ? true : null,
     win: num('tw'),
     nextAction: p.get('na'),
     freeSpins: (num('fs') ?? 0) > 0,
@@ -505,8 +505,8 @@ export function createE2EBrowserAdapter(
         slotGuard = null;
         throw new SlotRunError('GAME_NOT_OPEN', 0, 0);
       }
-      if (gameState.stake !== stake || gameState.anteOn) {
-        console.log(`BET NOT AT STAKE: game is at ${gameState.stake}${gameState.anteOn ? ' with ante bet on' : ''}, `
+      if (gameState.stake !== stake || gameState.anteOn !== false) {
+        console.log(`BET NOT AT STAKE: game is at ${gameState.stake}${gameState.anteOn === false ? '' : ' with ante bet on or unverifiable'}, `
           + `requested ${stake}. Set it by hand in the game once; the game remembers it.`);
         await browser.unroute(GAME_SERVICE);
         slotGuard = null;
@@ -677,7 +677,7 @@ export function createE2EBrowserAdapter(
           guardSlotAction({ type: 'spin', spins: i + 1 });
           guardSlotAction({ type: 'wager', wager: stake });
           if (Math.round((i + 1) * stake * 100) > Math.round(spins * 0.2 * 100)) throw new Error('SPEND_CAP_EXCEEDED');
-          if (stake !== 0.2 || gameState.stake !== stake || gameState.anteOn) throw new Error('STAKE_MISMATCH');
+          if (stake !== 0.2 || gameState.stake !== stake || gameState.anteOn !== false) throw new Error('STAKE_MISMATCH');
           if (guard.blocked) throw new Error(guard.blocked);
           await clearBlockingOverlay(i + 1);
           await midscene.aiWaitFor(
@@ -746,7 +746,8 @@ export function createE2EBrowserAdapter(
           const extracted = extractSpinSettlement(responses);
           const first = extracted.firstStakeResponse;
           // Second check, from the server's side.
-          if (first.stake !== stake || first.anteOn) throw new Error('STAKE_MISMATCH');
+          const stakeFailure = spinStakeFailureCode(first, stake);
+          if (stakeFailure || first.stake === null) throw new Error(stakeFailure ?? 'STAKE_MISMATCH');
  
           // The first response carrying the server stake is the authoritative doSpin settlement.
           const win = extracted.win;

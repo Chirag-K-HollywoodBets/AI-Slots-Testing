@@ -10,6 +10,8 @@ import {
   pollHeaderBalance,
   spinBalanceMatches,
   spinCollectionFailureCode,
+  spinStakeFailureCode,
+  type WinCelebrationState,
   waitForWinCelebrationClear,
   winCelebrationFailureCode,
 } from '../../src/agent/slot-run-control';
@@ -18,7 +20,7 @@ describe('slot run controls', () => {
   it('ends normally after one doSpin response without producing SPIN_OUTCOME_UNKNOWN', async () => {
     let publish: ((response: string) => void) | undefined;
     const seen: string[] = [];
-    const result = await collectResponseQuietWindow(
+    const result = await collectResponseQuietWindow<string>(
       (listener) => { publish = listener; return () => { publish = undefined; }; },
       async () => { publish?.('doSpin'); },
       async (response) => { seen.push(response); },
@@ -39,6 +41,18 @@ describe('slot run controls', () => {
     expect(settlement.win).toBe(0);
     expect(settlement.balance).toBe(99.8);
     expect(spinBalanceMatches(100, settlement.firstStakeResponse.stake!, settlement.win, settlement.balance!)).toBe(true);
+  });
+
+  it('fails closed when a doSpin ante field is enabled, missing, or invalid', () => {
+    const anteOff = parseGameResponse('action=doSpin&c=0.01&l=20&bl=0&tw=0&balance=99.80');
+    const anteOn = parseGameResponse('action=doSpin&c=0.01&l=20&bl=1&tw=0&balance=99.80');
+    const missingAnte = parseGameResponse('action=doSpin&c=0.01&l=20&tw=0&balance=99.80');
+
+    expect(spinStakeFailureCode(anteOff, 0.2)).toBeNull();
+    expect(spinStakeFailureCode(anteOn, 0.2)).toBe('STAKE_MISMATCH');
+    expect(spinStakeFailureCode(missingAnte, 0.2)).toBe('STAKE_MISMATCH');
+    expect(spinStakeFailureCode(parseGameResponse('action=doSpin&c=0.01&l=20&bl=unknown'), 0.2))
+      .toBe('STAKE_MISMATCH');
   });
 
   it('uses the last tumble/doCollect win and balance and persists fields from every response', () => {
@@ -84,11 +98,11 @@ describe('slot run controls', () => {
   });
 
   it('waits passively for a win celebration to clear and then continues', async () => {
-    const states = [
+    const states: WinCelebrationState[] = [
       { overlay: 'win_celebration', blocksSpin: true },
       { overlay: 'none', blocksSpin: false },
     ];
-    const read = vi.fn(async () => states.shift()!);
+    const read = vi.fn(async (): Promise<WinCelebrationState> => states.shift() ?? { overlay: 'none', blocksSpin: false });
     const pause = vi.fn(async () => undefined);
     const click = vi.fn();
     const result = await waitForWinCelebrationClear(read, pause, { intervalMs: 2500, maxWaitMs: 15000 });
@@ -99,19 +113,19 @@ describe('slot run controls', () => {
   });
 
   it('hands any newly visible overlay to the full pre-spin gate after celebration clears', async () => {
-    const states = [
+    const states: WinCelebrationState[] = [
       { overlay: 'win_celebration', blocksSpin: true },
       { overlay: 'prize_drops', blocksSpin: true },
     ];
     const result = await waitForWinCelebrationClear(
-      async () => states.shift()!, async () => undefined,
+      async () => states.shift() ?? { overlay: 'none', blocksSpin: false }, async () => undefined,
       { intervalMs: 2500, maxWaitMs: 15000 },
     );
     expect(result).toMatchObject({ cleared: true, state: { overlay: 'prize_drops', blocksSpin: true } });
   });
 
   it('reports OVERLAY_BLOCKING when the win celebration persists without clicking', async () => {
-    const read = vi.fn(async () => ({ overlay: 'win_celebration', blocksSpin: true }));
+    const read = vi.fn(async (): Promise<WinCelebrationState> => ({ overlay: 'win_celebration', blocksSpin: true }));
     const pause = vi.fn(async () => undefined);
     const click = vi.fn();
     const result = await waitForWinCelebrationClear(read, pause, { intervalMs: 2500, maxWaitMs: 5000 });
@@ -124,7 +138,7 @@ describe('slot run controls', () => {
 
   it('polls until the server balance reaches the header and reports lag on timeout', async () => {
     const values = [100, 99.8];
-    const settled = await pollHeaderBalance(async () => values.shift()!, 99.8,
+    const settled = await pollHeaderBalance(async () => values.shift() ?? 99.8, 99.8,
       { timeoutMs: 20, intervalMs: 1, pause: async () => undefined });
     expect(settled).toEqual({ matched: true, lastValue: 99.8 });
 
