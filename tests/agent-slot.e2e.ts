@@ -9,13 +9,17 @@ import { PlaywrightPageAgent } from '@midscene/web/playwright';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-import { executePlan } from '../src/agent/executor';
+import { executePlan, type ActionResult, type SuccessfulPlaySlotActionResult } from '../src/agent/executor';
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
-import { expectedSlotBalanceAfterSpins, parseRand } from '../src/agent/slot-settlement';
+import { parseRand, settleSlotObservation, type SlotObservation } from '../src/agent/slot-settlement';
 import { configureMidsceneModel, logMidsceneModelConfig } from '../src/agent/midscene-model';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
+
+function isSuccessfulSlotResult(result: ActionResult): result is SuccessfulPlaySlotActionResult {
+  return result.action.type === 'play_slot' && result.success;
+}
 const CDP_ENDPOINT = 'http://127.0.0.1:9223';
 type MidsceneTimeout = number | 'Midscene default';
 
@@ -33,7 +37,12 @@ async function runPhase<T>(name: string, action: () => Promise<T>): Promise<T> {
 }
 
 function redactModelSecret(text: string): string {
-  const secrets = [process.env.MIDSCENE_MODEL_API_KEY, process.env.LLM_API_KEY].filter(
+  const secrets = [
+    process.env.MIDSCENE_MODEL_API_KEY,
+    process.env.LLM_API_KEY,
+    process.env.E2E_USER_HB_TEST_USERNAME,
+    process.env.E2E_USER_HB_TEST_PASSWORD,
+  ].filter(
     (value): value is string => Boolean(value),
   );
   return secrets.reduce((safe, secret) => safe.replaceAll(secret, '[REDACTED]'), text);
@@ -111,10 +120,25 @@ test(
 
     test.skip(!planPath, 'run from the chat server with AGENT_PLAN_PATH');
 
-    async function saveReport(data: unknown) {
+    const savedReportState: { value: Record<string, unknown> | null } = { value: null };
+    let evidenceState: Record<string, unknown> = {
+      runId: process.env.AGENT_RUN_ID ?? null,
+      status: 'RUNNING',
+      success: false,
+      plan: null,
+      balanceBefore: null,
+      gameState: null,
+      spinResults: [],
+      overlayEvents: 'See run.log for overlay classifications, dismissal coordinates, and zone decisions.',
+      screenshots: [],
+    };
+
+    async function saveReport(data: Record<string, unknown>) {
+      const report = { ...evidenceState, ...data };
+      savedReportState.value = report;
       if (!reportPath) return;
       await mkdir(dirname(reportPath), { recursive: true });
-      await writeFile(reportPath, JSON.stringify(data, null, 2), 'utf8');
+      await writeFile(reportPath, redactModelSecret(JSON.stringify(report, null, 2)), 'utf8');
     }
 
     const preflight = await runPhase('Revalidate the confirmed casino plan and spin gate', async () => {
@@ -141,6 +165,7 @@ test(
       throw new Error('SLOT_PLAN_PREFLIGHT_SKIPPED');
     }
     const plan = preflight.plan;
+    evidenceState = { ...evidenceState, plan };
 
     await app.open('/');
 
@@ -149,11 +174,10 @@ test(
     let midscenePage: Page | undefined;
     let pageBindingKey: string | undefined;
     let pageBindingToken: string | undefined;
-    let balanceBefore: number | null = null;
-    let balanceAfter: number | null = null;
+    const balanceBeforeState: { value: number | null } = { value: null };
+    const balanceAfterState: { value: number | null } = { value: null };
     let midsceneBalance: number | null = null;
     let midsceneFailure: { step: string; spin: number | null } | null = null;
-
     try {
       const midscene = await runPhase('Attach read-only Midscene to the runner page', async () => {
         const modelConfig = configureMidsceneModel();
@@ -228,56 +252,94 @@ test(
       const balanceBeforeText = await runPhase('Read header balance before opening the game', async () => {
         await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
         const value = await balanceLocator.textContent();
-        balanceBefore = parseRand(value);
-        if (balanceBefore < 0) throw new Error('HEADER_BALANCE_BEFORE_INVALID');
-        console.log(`Balance before (header): ${value?.trim() ?? ''} => R${balanceBefore.toFixed(2)}`);
+        const parsedBalance = parseRand(value);
+        if (parsedBalance < 0) throw new Error('HEADER_BALANCE_BEFORE_INVALID');
+        balanceBeforeState.value = parsedBalance;
+        console.log(`Balance before (header): ${value?.trim() ?? ''} => R${parsedBalance.toFixed(2)}`);
         return value?.trim() ?? '';
       });
+      const balanceBefore = balanceBeforeState.value;
+      if (balanceBefore === null) throw new Error('HEADER_BALANCE_BEFORE_MISSING');
+      evidenceState = { ...evidenceState, balanceBefore, headerBalanceBefore: balanceBeforeText };
 
       const adapter = createE2EBrowserAdapter(browser, app, SITE_URL, screen, midscene);
       const started = Date.now();
       const report = await runPhase('Open Games in Olympus, verify R0.20, and play the confirmed spins', async () =>
         executePlan(plan, adapter));
       const durationMs = Date.now() - started;
-      const slotObservation = report.results.find((result) => result.action.type === 'play_slot')?.observation;
-      const spinResults = Array.isArray(slotObservation) ? slotObservation as Array<{ stake: number; win: number; balance: number }> : [];
+      const gameState = report.results.find((result) => result.action.type === 'open_game')?.observation ?? null;
+      evidenceState = { ...evidenceState, gameState };
 
-      const actionReports = report.results.map((r) => ({
-        type: r.action.type,
-        success: r.success,
-        ...('game' in r.action ? { game: r.action.game } : {}),
-        ...(r.action.type === 'play_slot'
-          ? {
-            spins: r.action.spins,
-            stake: r.action.stake,
-            result: Array.isArray(r.observation)
-              ? {
-                spins: r.observation,
-                completedSpins: r.observation.length,
-                attemptedSpins: r.observation.length,
-                stoppedBeforeAnySpin: false,
-              }
-              : r.observation ?? null,
+      const actionReports = report.results.map((r) => {
+        const details: Record<string, unknown> = {
+          type: r.action.type,
+          success: r.success,
+          ...('game' in r.action ? { game: r.action.game } : {}),
+        };
+        if (r.action.type === 'play_slot') {
+          details.spins = r.action.spins;
+          details.stake = r.action.stake;
+          if (isSuccessfulSlotResult(r)) {
+            const observation: SlotObservation = r.observation;
+            details.result = {
+              ...observation,
+              completedSpins: observation.spins.length,
+              attemptedSpins: observation.spins.length,
+              stoppedBeforeAnySpin: false,
+            };
+          } else {
+            details.result = r.observation ?? null;
+            if (!r.success) details.error = r.error;
           }
-          : {}),
-        ...(r.error ? { error: r.error } : {}),
-      }));
+        } else if (r.action.type === 'open_game') {
+          details.gameState = r.observation ?? null;
+          if (!r.success) details.error = r.error;
+        } else if (!r.success) {
+          details.error = r.error;
+        }
+        return details;
+      });
 
       if (!report.success) {
         const failedReport = {
           status: 'FAIL',
           success: false,
           durationMs,
+          plan,
           balanceBefore,
           headerBalanceBefore: balanceBeforeText,
+          gameState,
           ...(midsceneFailure ? { midsceneFailure } : {}),
           actions: actionReports,
         };
         await saveReport(failedReport);
         console.log('Execution report:', JSON.stringify(failedReport, null, 2));
         const failure = report.results.find((result) => !result.success);
-        throw new Error(failure?.error ?? 'Casino plan failed');
+        if (failure && !failure.success) throw new Error(failure.error);
+        throw new Error('Casino plan failed');
       }
+
+      const slotResult = report.results.find(
+        isSuccessfulSlotResult,
+      );
+      if (!slotResult) throw new Error('SPIN_SETTLEMENT_DATA_INCOMPLETE');
+      const settledBalanceBefore = balanceBefore;
+      const slotObservation: SlotObservation = slotResult.observation;
+      const settlement = settleSlotObservation(
+        settledBalanceBefore,
+        slotObservation,
+        Number(process.env.HB_SPINS ?? '1'),
+      );
+      const { spinResults } = settlement;
+      evidenceState = {
+        ...evidenceState,
+        spinResults,
+        settlement: {
+          totalStaked: settlement.totalStaked,
+          totalWon: settlement.totalWon,
+          expectedBalance: settlement.expectedBalance,
+        },
+      };
 
       const balanceAfterText = await runPhase('Read header balance after the spins and compare', async () => {
         await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
@@ -285,7 +347,7 @@ test(
         const headerBalanceAfter = parseRand(value);
         console.log(`Balance after (header): ${value} => R${headerBalanceAfter.toFixed(2)}`);
 
-        if (headerBalanceAfter === balanceBefore) {
+        if (headerBalanceAfter === settledBalanceBefore) {
           const visual = await midscene.aiQuery(
             '{ balance: number }, read the current in-game balance shown in the game canvas as a South African rand amount. Return only the numeric balance, without currency symbols.'
           ) as unknown;
@@ -294,43 +356,68 @@ test(
             : visual;
           midsceneBalance = parseRand(typeof visualValue === 'string' || typeof visualValue === 'number' ? visualValue : null);
           console.log(`Balance fallback (Midscene): ${JSON.stringify(visual)} => R${midsceneBalance.toFixed(2)}`);
-          balanceAfter = midsceneBalance;
+          balanceAfterState.value = midsceneBalance;
         } else {
-          balanceAfter = headerBalanceAfter;
+          balanceAfterState.value = headerBalanceAfter;
         }
 
+        const balanceAfter = balanceAfterState.value;
         if (balanceAfter === null || !Number.isFinite(balanceAfter) || balanceAfter < 0) {
           throw new Error('BALANCE_AFTER_INVALID');
         }
-        if (balanceBefore === null || spinResults.length !== Number(process.env.HB_SPINS ?? '1')) {
-          throw new Error('SPIN_SETTLEMENT_DATA_INCOMPLETE');
+        console.log(`Balance settlement: before=R${settledBalanceBefore.toFixed(2)} spins=${spinResults.length} staked=R${settlement.totalStaked.toFixed(2)} totalWon=R${settlement.totalWon.toFixed(2)} expected=R${settlement.expectedBalance.toFixed(2)} actual=R${balanceAfter.toFixed(2)}`);
+        const settlementEvidence = evidenceState.settlement as Record<string, unknown>;
+        evidenceState = {
+          ...evidenceState,
+          balanceAfter,
+          settlement: { ...settlementEvidence, actualBalance: balanceAfter },
+        };
+        if (balanceAfter !== settlement.expectedBalance) {
+          await saveReport({
+            status: 'FAIL', success: false, reason: 'BALANCE_SETTLEMENT_MISMATCH', durationMs,
+            plan, balanceBefore, balanceAfter, gameState, spinResults, actions: actionReports,
+          });
+          throw new Error('BALANCE_SETTLEMENT_MISMATCH');
         }
-        const totalWon = spinResults.reduce((sum, spin) => sum + spin.win, 0);
-        const expectedBalance = expectedSlotBalanceAfterSpins(
-          balanceBefore,
-          spinResults.length,
-          spinResults[0].stake,
-          totalWon,
-        );
-        console.log(`Balance settlement: before=R${balanceBefore.toFixed(2)} spins=${spinResults.length} stake=R${spinResults[0].stake.toFixed(2)} totalWon=R${totalWon.toFixed(2)} expected=R${expectedBalance.toFixed(2)} actual=R${balanceAfter.toFixed(2)}`);
-        if (balanceAfter !== expectedBalance) throw new Error('BALANCE_SETTLEMENT_MISMATCH');
         return value;
       });
+      const balanceAfter = balanceAfterState.value;
+      if (balanceAfter === null) throw new Error('BALANCE_AFTER_INVALID');
 
       const safeReport = {
         status: report.success ? 'PASS' : 'FAIL',
         success: report.success,
         durationMs,
+        plan,
         balanceBefore,
         balanceAfter,
         headerBalanceBefore: balanceBeforeText,
         headerBalanceAfter: balanceAfterText,
+        gameState,
+        spinResults,
+        settlement: {
+          totalStaked: settlement.totalStaked,
+          totalWon: settlement.totalWon,
+          expectedBalance: settlement.expectedBalance,
+          actualBalance: balanceAfter,
+        },
         ...(midsceneBalance === null ? {} : { midsceneBalance }),
         actions: actionReports,
       };
 
       await saveReport(safeReport);
       console.log('Execution report:', JSON.stringify(safeReport, null, 2));
+    } catch (error) {
+      if (!savedReportState.value || savedReportState.value.status === 'RUNNING') {
+        const message = error instanceof Error ? error.message : '';
+        await saveReport({
+          status: 'FAIL',
+          success: false,
+          reason: /^[A-Z0-9_]+$/.test(message) ? message : 'SLOT_RUN_FAILED',
+          ...(midsceneFailure ? { midsceneFailure } : {}),
+        });
+      }
+      throw error;
     } finally {
       if (pageBindingKey) {
         await browser.evaluate((key: string) => Reflect.deleteProperty(window, key), pageBindingKey).catch(() => {});

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Server } from 'node:http';
 import { request as httpRequest } from 'node:http';
-import { mkdtemp, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { reduceSportsConversation, type PendingSportsRequest, type SportsInterpretation, type SportsConversationState } from '../../src/agent/sports-conversation';
@@ -12,6 +12,8 @@ const { createChatServer } = require('../../chat/server.cjs') as { createChatSer
   prepareReview: (...args: unknown[]) => Promise<unknown>;
   runPlan: (...args: unknown[]) => Promise<unknown>;
   inspectSlots?: (instruction: string) => Promise<unknown>;
+  checkSlotsReadiness?: () => Promise<any>;
+  createSlotsEvidence?: (plan: unknown) => Promise<any>;
   getActiveReview?: () => unknown;
   reviewStatus?: (...args: unknown[]) => Promise<unknown>;
   submitReview?: (...args: unknown[]) => Promise<unknown>;
@@ -55,6 +57,8 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   const prepareReview = vi.fn();
   const runPlan = vi.fn();
   const inspectSlots = vi.fn();
+  const checkSlotsReadiness = vi.fn();
+  const createSlotsEvidence = vi.fn();
   const reviewStatus = vi.fn();
   const submitReview = vi.fn();
   const reviewIsReady = vi.fn(() => true);
@@ -63,6 +67,7 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   let submissionEnabled = false;
   let activeReview: any;
   let previousSlotsPlayFlag: string | undefined;
+  const evidenceDirectories: string[] = [];
 
   beforeEach(async () => {
     previousSlotsPlayFlag = process.env.ENABLE_SLOTS_PLAY;
@@ -72,9 +77,20 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     activeReview = null;
     prepareReview.mockResolvedValue({ id: 'review-1' });
     runPlan.mockResolvedValue({ code: 0, report: { status: 'PASS', success: true, actions: [] } });
+    checkSlotsReadiness.mockResolvedValue({ ready: true, result: { ready: true }, stdout: '{"ready":true}', stderr: '' });
+    createSlotsEvidence.mockImplementation(async (plan: unknown) => {
+      const directory = await mkdtemp(join(tmpdir(), 'hwb-slots-test-'));
+      evidenceDirectories.push(directory);
+      const evidence = {
+        runId: 'test-slot-run', startedAt: '2026-11-05T00:00:00.000Z', directory, plan,
+        planPath: join(directory, 'plan.json'), reportPath: join(directory, 'report.json'), logPath: join(directory, 'run.log'),
+      };
+      await writeFile(evidence.logPath, '', 'utf8');
+      return evidence;
+    });
     inspectSlots.mockResolvedValue({ mode: 'SLOTS_INSPECT', status: 'READ_ONLY_INSPECTION_COMPLETE', success: true, logs: '', screenshot: null });
     verifySubmissionEvidence.mockReturnValue(true);
-    server = createChatServer({ planMessage, prepareReview, runPlan, inspectSlots, getActiveReview: () => activeReview,
+    server = createChatServer({ planMessage, prepareReview, runPlan, inspectSlots, checkSlotsReadiness, createSlotsEvidence, getActiveReview: () => activeReview,
       reviewStatus, submitReview, reviewIsReady, reviewRunnerAvailable, verifySubmissionEvidence,
       getSubmissionEnabled: () => submissionEnabled });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -87,6 +103,7 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
       server.closeAllConnections();
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     } finally {
+      await Promise.all(evidenceDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
       if (previousSlotsPlayFlag === undefined) delete process.env.ENABLE_SLOTS_PLAY;
       else process.env.ENABLE_SLOTS_PLAY = previousSlotsPlayFlag;
     }
@@ -300,6 +317,28 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     expect(confirmed.code).toBe(403);
     expect(confirmed.result.code).toBe('MODE_PLAN_MISMATCH');
     expect(runPlan).not.toHaveBeenCalled();
+  });
+
+  it('blocks slot dispatch and preserves a readiness report when the model gate fails', async () => {
+    process.env.ENABLE_SLOTS_PLAY = '1';
+    const cookie = await session();
+    planMessage.mockResolvedValueOnce(plannedSlot());
+    checkSlotsReadiness.mockResolvedValueOnce({
+      ready: false,
+      result: { ready: false, code: 'MODEL_UNAVAILABLE', stage: 'image-input', reason: 'HTTP 400 Bad Request: image unsupported' },
+      stdout: '{"ready":false}',
+      stderr: '',
+    });
+
+    const summary = await post(cookie, '/api/run', { mode: 'SLOTS_PLAY', instruction: slotInstruction });
+    const response = await post(cookie, '/api/confirm', { planId: summary.result.planId });
+
+    expect(response.result.status).toBe('MODEL_UNAVAILABLE');
+    expect(response.result.reason).toContain('image unsupported');
+    expect(checkSlotsReadiness).toHaveBeenCalledOnce();
+    expect(runPlan).not.toHaveBeenCalled();
+    const saved = JSON.parse(await readFile(response.result.evidence.reportPath, 'utf8'));
+    expect(saved).toMatchObject({ status: 'MODEL_UNAVAILABLE', plan: plannedSlot().plan });
   });
 
   it('enabled SLOTS_PLAY presents a one-spin R0.20 Games in Olympus confirmation', async () => {

@@ -1,7 +1,7 @@
 
 const http = require('node:http');
 const { spawn } = require('node:child_process');
-const { readFile, writeFile, mkdtemp, rm } = require('node:fs/promises');
+const { readFile, writeFile, mkdtemp, rm, mkdir, appendFile, readdir } = require('node:fs/promises');
 const { randomUUID } = require('node:crypto');
 const path = require('node:path');
 const os = require('node:os');
@@ -95,6 +95,110 @@ async function runMidsceneInspection(instruction) {
       logs: (result.logs || (stdout + stderr)).slice(-4000),
       screenshot: result.screenshot || (await readFile(screenshotPath).then((b) => b.toString('base64')).catch(() => null)) };
   } finally { await rm(directory, { recursive: true, force: true }); }
+}
+
+function redactEvidenceText(text) {
+  const secretNames = [
+    'MIDSCENE_MODEL_API_KEY', 'LLM_API_KEY',
+    'E2E_USER_HB_TEST_USERNAME', 'E2E_USER_HB_TEST_PASSWORD',
+  ];
+  return secretNames.reduce((safe, name) => {
+    const secret = process.env[name];
+    return secret ? safe.replaceAll(secret, '[REDACTED]') : safe;
+  }, text);
+}
+
+async function createSlotRunEvidence(plan) {
+  const runId = randomUUID();
+  const startedAt = new Date().toISOString();
+  const timestamp = startedAt.replace(/[:.]/g, '-');
+  const directory = path.join(PROJECT, 'reports', 'slots', `${timestamp}-${runId}`);
+  await mkdir(directory, { recursive: true });
+  const evidence = {
+    runId,
+    startedAt,
+    directory,
+    planPath: path.join(directory, 'plan.json'),
+    reportPath: path.join(directory, 'report.json'),
+    logPath: path.join(directory, 'run.log'),
+    plan,
+  };
+  await writeFile(evidence.planPath, redactEvidenceText(JSON.stringify(plan, null, 2)), 'utf8');
+  await writeFile(evidence.logPath,
+    `[SLOT RUN] runId=${runId} startedAt=${startedAt}\n=== PLAN ===\n${redactEvidenceText(JSON.stringify(plan, null, 2))}\n`,
+    'utf8');
+  return evidence;
+}
+
+async function appendSlotEvidenceLog(evidence, section, stdout = '', stderr = '') {
+  const output = `\n=== ${section} stdout ===\n${stdout}\n=== ${section} stderr ===\n${stderr}\n`;
+  await appendFile(evidence.logPath, redactEvidenceText(output), 'utf8');
+}
+
+async function finalizeSlotEvidence(evidence, report, code, runnerError) {
+  const success = code === 0 && report.success === true;
+  const logText = await readFile(evidence.logPath, 'utf8').catch(() => '');
+  const logLines = logText.split(/\r?\n/);
+  const logEvidence = {
+    balanceBeforeLine: logLines.find((line) => line.startsWith('Balance before (header):')) ?? null,
+    gameStateLine: logLines.find((line) => line.startsWith('GAME STATE:')) ?? null,
+    spinLines: logLines.filter((line) => /doSpin response|SPIN \d+ SETTLED|SLOT RUN STOP/.test(line)),
+    balanceSettlementLine: logLines.find((line) => line.startsWith('Balance settlement:')) ?? null,
+    overlayEvents: logLines.filter((line) => /SPIN \d+ OVERLAY|OVERLAY DISMISS|SPIN \d+ DISMISS/.test(line)),
+  };
+  const screenshots = (await readdir(evidence.directory, { withFileTypes: true }))
+    .filter((entry) => entry.isFile() && /\.(png|jpe?g|webp)$/i.test(entry.name))
+    .map((entry) => path.join(evidence.directory, entry.name));
+  const finalReport = {
+    ...report,
+    status: success ? 'PASS' : report.status === 'MODEL_UNAVAILABLE' ? 'MODEL_UNAVAILABLE' : 'FAIL',
+    success,
+    runId: evidence.runId,
+    startedAt: evidence.startedAt,
+    completedAt: new Date().toISOString(),
+    plan: evidence.plan,
+    ...(evidence.readiness ? { readiness: evidence.readiness } : {}),
+    logEvidence,
+    ...(runnerError ? { runnerError: redactEvidenceText(runnerError) } : {}),
+    evidence: {
+      directory: evidence.directory,
+      planPath: evidence.planPath,
+      reportPath: evidence.reportPath,
+      logPath: evidence.logPath,
+      screenshots,
+    },
+  };
+  const safeReport = JSON.parse(redactEvidenceText(JSON.stringify(finalReport)));
+  await writeFile(evidence.reportPath, JSON.stringify(safeReport, null, 2), 'utf8');
+  console.log(`[SLOT_RUN_EVIDENCE] status=${safeReport.status} report=${evidence.reportPath} log=${evidence.logPath}`);
+  return safeReport;
+}
+
+async function runSlotsModelReadiness() {
+  const tsxCli = path.join(PROJECT, 'node_modules', 'tsx', 'dist', 'cli.mjs');
+  let stdout = '';
+  let stderr = '';
+  try {
+    const result = await runNode([tsxCli, 'scripts/midscene/check-readiness.ts'], {}, 150000);
+    stdout = result.stdout;
+    stderr = result.stderr;
+    const jsonLine = stdout.split(/\r?\n/).find((line) => line.trim().startsWith('{'));
+    const parsed = jsonLine ? JSON.parse(jsonLine) : null;
+    if (result.code === 0 && parsed?.ready === true) return { ready: true, result: parsed, stdout, stderr };
+    return {
+      ready: false,
+      result: parsed ?? { code: 'MODEL_UNAVAILABLE', reason: 'Readiness process returned no JSON result.' },
+      stdout,
+      stderr,
+    };
+  } catch (error) {
+    return {
+      ready: false,
+      result: { code: 'MODEL_UNAVAILABLE', reason: error instanceof Error ? error.message : String(error) },
+      stdout,
+      stderr,
+    };
+  }
 }
 
 function renderHtml() {
@@ -250,35 +354,42 @@ function describePlan(plan) {
 }
 
 // Writes the plan to a temp file, runs one test file, returns the report.
-async function executePlanFile(plan, testFile, extraEnv) {
-  const directory = await mkdtemp(path.join(os.tmpdir(), 'hwb-agent-'));
+async function executePlanFile(plan, testFile, extraEnv, slotEvidence) {
+  if (testFile === SLOT_TEST && !slotEvidence) slotEvidence = await createSlotRunEvidence(plan);
+  const directory = slotEvidence ? null : await mkdtemp(path.join(os.tmpdir(), 'hwb-agent-'));
   try {
-    const planPath = extraEnv.AGENT_PLAN_PATH || path.join(directory, 'plan.json');
-    const reportPath = extraEnv.AGENT_REPORT_PATH || path.join(directory, 'report.json');
-    await writeFile(planPath, JSON.stringify(plan), 'utf8');
+    const planPath = slotEvidence?.planPath || extraEnv.AGENT_PLAN_PATH || path.join(directory, 'plan.json');
+    const reportPath = slotEvidence?.reportPath || extraEnv.AGENT_REPORT_PATH || path.join(directory, 'report.json');
+    const logPath = slotEvidence?.logPath;
+    if (!slotEvidence) await writeFile(planPath, JSON.stringify(plan), 'utf8');
 
     let code;
+    let runnerError;
     try {
       code = await runTest(testFile, {
         AGENT_PLAN_PATH: planPath,
         AGENT_REPORT_PATH: reportPath,
+        ...(slotEvidence ? { AGENT_RUN_ID: slotEvidence.runId, AGENT_EVIDENCE_DIR: slotEvidence.directory } : {}),
         ...extraEnv
-      }, testFile === SLOT_TEST ? 600000 : extraEnv.AGENT_REVIEW_ID ? 950000 : testFile === SPORTS_TEST ? 300000 : 120000);
+      }, testFile === SLOT_TEST ? 600000 : extraEnv.AGENT_REVIEW_ID ? 950000 : testFile === SPORTS_TEST ? 300000 : 120000, logPath);
     } catch (error) {
       // A failed run can still have written a useful report.
       code = -1;
-      if (!/exited with code/.test(error.message)) throw error;
+      runnerError = error instanceof Error ? error.message : String(error);
+      if (!/exited with code/.test(runnerError) && !slotEvidence) throw error;
+      if (slotEvidence) await appendSlotEvidenceLog(slotEvidence, 'E2E runner failure', '', runnerError);
     }
 
     let report;
     try {
       report = JSON.parse(await readFile(reportPath, 'utf8'));
     } catch {
-      throw new Error('NO_REPORT');
+      report = { status: 'FAIL', success: false, reason: runnerError || 'NO_REPORT', actions: [] };
     }
+    if (slotEvidence) report = await finalizeSlotEvidence(slotEvidence, report, code, runnerError);
     return { code, report };
   } finally {
-    await rm(directory, { recursive: true, force: true });
+    if (directory) await rm(directory, { recursive: true, force: true });
   }
 }
 
@@ -367,7 +478,7 @@ async function readReviewStatus(review) {
   }
 }
 
-function runTest(testFile, extraEnv, timeoutMs) {
+function runTest(testFile, extraEnv, timeoutMs, logPath) {
   return new Promise((resolveRun, reject) => {
     const e2eCli = path.join(
       PROJECT,
@@ -407,11 +518,13 @@ function runTest(testFile, extraEnv, timeoutMs) {
     let timedOut = false;
 
     child.stdout.on('data', (chunk) => {
-      stdout = (stdout + chunk.toString()).slice(-12000);
+      const next = stdout + chunk.toString();
+      stdout = logPath ? next : next.slice(-12000);
     });
 
     child.stderr.on('data', (chunk) => {
-      stderr = (stderr + chunk.toString()).slice(-12000);
+      const next = stderr + chunk.toString();
+      stderr = logPath ? next : next.slice(-12000);
     });
 
     const timeout = setTimeout(() => {
@@ -425,8 +538,12 @@ function runTest(testFile, extraEnv, timeoutMs) {
       reject(new Error('Unable to launch E2E process'));
     });
 
-    child.on('close', (code, signal) => {
+    child.on('close', async (code, signal) => {
       clearTimeout(timeout);
+
+      if (logPath) {
+        await appendFile(logPath, redactEvidenceText(`\n=== E2E stdout ===\n${stdout}\n=== E2E stderr ===\n${stderr}\n`), 'utf8');
+      }
 
       console.log('E2E exit code:', code);
       console.log('E2E termination signal:', signal);
@@ -441,8 +558,8 @@ function runTest(testFile, extraEnv, timeoutMs) {
       } else {
         // Local diagnostics only. Do not enable unrestricted
         // output logging for authenticated production tests.
-        console.error('E2E stdout:', stdout);
-        console.error('E2E stderr:', stderr);
+        console.error('E2E stdout:', redactEvidenceText(stdout));
+        console.error('E2E stderr:', redactEvidenceText(stderr));
 
         reject(
           new Error('E2E process exited with code ' + code)
@@ -493,6 +610,7 @@ function reportResponse(res, code, report, usage, extra = {}, respond = (data) =
     reason: report.reason,
     durationMs: report.durationMs,
     actions: report.actions ?? [],
+    ...(report.evidence ? { evidence: report.evidence } : {}),
     ...extra
   }, usage));
 }
@@ -508,6 +626,8 @@ async function readJsonBody(req) {
 
 function createChatServer({ planMessage = planInstruction, prepareReview = startReviewRun, runPlan = executePlanFile,
   inspectSlots = runMidsceneInspection,
+  checkSlotsReadiness = runSlotsModelReadiness,
+  createSlotsEvidence = createSlotRunEvidence,
   getActiveReview = () => activeReview, reviewStatus = readReviewStatus,
   reviewIsReady = (review) => reviews.get(review.id)?.state === 'ready',
   reviewRunnerAvailable = (review) => Boolean(review.reviewDecisionPath && review.submissionResultPath && !review.terminal),
@@ -815,9 +935,24 @@ return http.createServer(async (req, res) => {
         confirmationInvalidated = true;
         return reply(withUsage({ status: 'REVIEW_STARTING', reviewId: review.id }, pending.usage));
       }
+      let slotEvidence;
+      if (pending.mode === 'SLOTS_PLAY') {
+        slotEvidence = await createSlotsEvidence(pending.plan);
+        const readiness = await checkSlotsReadiness();
+        slotEvidence.readiness = readiness.result ?? null;
+        await appendSlotEvidenceLog(slotEvidence, 'Midscene readiness', readiness.stdout, readiness.stderr);
+        if (!readiness.ready) {
+          const reason = readiness.result?.reason || 'Midscene model or image-input check failed.';
+          const report = await finalizeSlotEvidence(slotEvidence, {
+            status: 'MODEL_UNAVAILABLE', success: false, reason, actions: [],
+          }, -1, reason);
+          return reply({ status: 'MODEL_UNAVAILABLE', success: false, reason,
+            evidence: report.evidence, actions: [] });
+        }
+      }
       const testFile = isSports ? SPORTS_TEST : SLOT_TEST;
       const env = isSports ? { ALLOW_SPORTS_PREPARE: '1' } : { ALLOW_SPINS: '1' };
-      const { code, report } = await runPlan(pending.plan, testFile, env);
+      const { code, report } = await runPlan(pending.plan, testFile, env, slotEvidence);
       return reportResponse(res, code, report, pending.usage, {}, reply);
     }
 

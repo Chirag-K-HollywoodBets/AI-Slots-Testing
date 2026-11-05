@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { extname, resolve } from 'node:path';
+import { buildMidsceneEndpointUrl } from '../../src/agent/midscene-model';
 
 const requiredEnvironment = [
   'MIDSCENE_MODEL_BASE_URL',
@@ -45,7 +46,7 @@ async function main(): Promise<void> {
 
   const image = await readFile(resolve(imagePath));
   const imageDataUrl = `data:${mimeType};base64,${image.toString('base64')}`;
-  const endpoint = `${baseUrl}/chat/completions`;
+  const endpoint = buildMidsceneEndpointUrl(baseUrl, 'chat/completions').href;
 
   const startedAt = performance.now();
   let response: Response | undefined;

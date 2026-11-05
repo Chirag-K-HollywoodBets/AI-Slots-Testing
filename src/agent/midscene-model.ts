@@ -16,8 +16,13 @@ export interface MidsceneModelOptions {
   allowLegacyLlmAliases?: boolean;
 }
 
+export function buildMidsceneEndpointUrl(baseUrl: string, path: string): URL {
+  const relativePath = path.replace(/^\/+/, '');
+  return new URL(relativePath, baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+}
+
 export function buildMidsceneModelsUrl(baseUrl: string): URL {
-  return new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+  return buildMidsceneEndpointUrl(baseUrl, 'models');
 }
 
 export function validateMidsceneModelsPayload(

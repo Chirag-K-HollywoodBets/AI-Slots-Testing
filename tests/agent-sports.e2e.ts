@@ -137,7 +137,7 @@ test(
     const ready = report.success && Boolean(preview && typeof preview === 'object'
       && (preview as { status?: string }).status === 'BETSLIP_READY'
       && (preview as { submitted?: boolean }).submitted === false);
-    const failureCode = sportsAction?.error;
+    const failureCode = sportsAction && !sportsAction.success ? sportsAction.error : undefined;
     const requestedTeam = sportsPlanAction.selections.map((selection) => selection.team).join(', ');
     const failureReason = failureCode === 'SPORTS_FIXTURE_NOT_FOUND'
       ? `No visible Premier League fixture matched ${requestedTeam}. No selection was added.`
@@ -165,7 +165,7 @@ test(
           ? { betslip: result.observation }
           : {}),
         ...(!result.success && result.observation ? { preparation: result.observation } : {}),
-        ...(result.error ? { error: result.error } : {}),
+        ...(!result.success ? { error: result.error } : {}),
       })),
     };
 

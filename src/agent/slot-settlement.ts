@@ -4,6 +4,27 @@ export interface SlotReadout {
   win: number;
 }
 
+export interface SlotSpinResult {
+  stake: number;
+  win: number;
+  balance: number;
+}
+
+/** Stable executor observation returned by a successful play_slot action. */
+export interface SlotObservation {
+  spins: SlotSpinResult[];
+  totalStaked: number;
+  totalWon: number;
+  finalBalance: number | null;
+}
+
+export interface SlotObservationSettlement {
+  spinResults: SlotSpinResult[];
+  totalStaked: number;
+  totalWon: number;
+  expectedBalance: number;
+}
+
 /** Parse rand text with either a comma or dot decimal and common thousands separators. */
 export function parseRand(value: unknown): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
@@ -38,6 +59,31 @@ export function expectedSlotBalanceAfterSpins(
     throw new Error('INVALID_SLOT_SETTLEMENT');
   }
   return roundMoney(balanceBefore - spins * stake + totalWon);
+}
+
+/** Extract the executor's typed observation and reconcile its reported spins. */
+export function settleSlotObservation(
+  balanceBefore: number,
+  observation: SlotObservation | undefined,
+  expectedSpins: number,
+): SlotObservationSettlement {
+  if (!observation || !Array.isArray(observation.spins)
+    || !Number.isInteger(expectedSpins) || expectedSpins < 1
+    || observation.spins.length !== expectedSpins || observation.spins.length === 0) {
+    throw new Error('SPIN_SETTLEMENT_DATA_INCOMPLETE');
+  }
+  if (!Number.isFinite(balanceBefore) || balanceBefore < 0
+    || observation.spins.some((spin) => !Number.isFinite(spin.stake) || spin.stake <= 0
+      || !Number.isFinite(spin.win) || spin.win < 0
+      || !Number.isFinite(spin.balance) || spin.balance < 0)) {
+    throw new Error('INVALID_SLOT_SETTLEMENT');
+  }
+
+  const cents = (value: number) => Math.round(value * 100);
+  const totalStaked = observation.spins.reduce((sum, spin) => sum + cents(spin.stake), 0) / 100;
+  const totalWon = observation.spins.reduce((sum, spin) => sum + cents(spin.win), 0) / 100;
+  const expectedBalance = Math.round((cents(balanceBefore) - cents(totalStaked) + cents(totalWon))) / 100;
+  return { spinResults: observation.spins, totalStaked, totalWon, expectedBalance };
 }
 
 function normalizeMoney(value: unknown, field: string, missingAsZero = false): number {

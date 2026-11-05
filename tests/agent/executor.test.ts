@@ -287,7 +287,7 @@ describe('Browser Executor', () => {
 
     expect(report.success).toBe(false);
     expect(report.results).toHaveLength(2);
-    expect(report.results[1].error).toBe('STAKE_MISMATCH');
+    expect(report.results[1]).toMatchObject({ success: false, error: 'STAKE_MISMATCH' });
     expect(browser.getPageInfo).not.toHaveBeenCalled();
   });
 });

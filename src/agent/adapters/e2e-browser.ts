@@ -475,7 +475,15 @@ export function createE2EBrowserAdapter(
         slotGuard = null;
         throw new Error('MIDSCENE_GAME_READY_FAILED', { cause: error });
       }
-      return { frameSrc: rect.host };
+      return {
+        frameSrc: rect.host,
+        gameState: {
+          rememberedStake: gameState.stake,
+          anteOn: gameState.anteOn,
+          balance: gameState.balance,
+          nextAction: gameState.nextAction,
+        },
+      };
     },
  
     async playSlot(game: string, spins: number, stake: number) {
@@ -621,11 +629,38 @@ export function createE2EBrowserAdapter(
                   : undefined;
             }
             const policy = { overlay: state.overlay, blocksSpin: state.blocksSpin, targetLabel };
-            if (!isSlotDismissTargetSafe(target, policy)) {
+            const margin = SLOT_DISMISS_TARGET_MARGIN;
+            const expandedTarget = {
+              left: target.left - margin.x,
+              top: target.top - margin.y,
+              right: target.left + target.width + margin.x,
+              bottom: target.top + target.height + margin.y,
+            };
+            const zoneDecisions = SLOT_NO_CLICK_ZONES.map((zone) => ({
+              name: zone.name,
+              intersects: !(expandedTarget.right <= zone.left || expandedTarget.left >= zone.right
+                || expandedTarget.bottom <= zone.top || expandedTarget.top >= zone.bottom),
+            }));
+            const bottomCentreIntersects = !(expandedTarget.right <= SLOT_BOTTOM_CENTRE_GUARD.left
+              || expandedTarget.left >= SLOT_BOTTOM_CENTRE_GUARD.right
+              || expandedTarget.bottom <= SLOT_BOTTOM_CENTRE_GUARD.top
+              || expandedTarget.top >= SLOT_BOTTOM_CENTRE_GUARD.bottom);
+            const safe = isSlotDismissTargetSafe(target, policy);
+            const click = { x: located.center[0] / dpr, y: located.center[1] / dpr };
+            console.log(`SPIN ${spinNumber} OVERLAY DISMISS DECISION: ${JSON.stringify({
+              decision: safe ? 'ALLOW' : 'REFUSE',
+              overlay: state.overlay,
+              blocksSpin: state.blocksSpin,
+              targetLabel,
+              target,
+              click,
+              protectedZones: zoneDecisions,
+              bottomCentreIntersects,
+            })}`);
+            if (!safe) {
               console.log(`SPIN ${spinNumber} OVERLAY DISMISS REFUSED: ${JSON.stringify({ ...policy, target })}`);
               throw new Error('OVERLAY_DISMISS_TARGET_PROTECTED');
             }
-            const click = { x: located.center[0] / dpr, y: located.center[1] / dpr };
             console.log(`SPIN ${spinNumber} DISMISS overlay=${state.overlay} attempt=${attempt} target=${JSON.stringify(target)}`);
             await clickAt(click.x, click.y);
             state = await queryOverlayState(spinNumber);

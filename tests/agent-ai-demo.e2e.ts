@@ -205,7 +205,7 @@ test(
             })()
           : {}),
 
-        ...(result.error
+        ...(!result.success
           ? { error: result.error }
           : {}),
       })),
