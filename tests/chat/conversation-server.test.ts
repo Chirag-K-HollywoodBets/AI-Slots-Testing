@@ -21,6 +21,7 @@ const { createChatServer } = require('../../chat/server.cjs') as { createChatSer
   getSubmissionEnabled?: () => boolean;
   reviewRunnerAvailable?: (...args: unknown[]) => boolean;
   verifySubmissionEvidence?: (...args: unknown[]) => boolean;
+  plannerMetricsPath?: string;
 }) => Server };
 const quote = (value: string) => ({ value, evidence: value });
 const complete: SportsInterpretation = { kind: 'new_request', updates: {
@@ -68,6 +69,7 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   let activeReview: any;
   let previousSlotsPlayFlag: string | undefined;
   const evidenceDirectories: string[] = [];
+  const plannerMetricsDirectories: string[] = [];
 
   beforeEach(async () => {
     previousSlotsPlayFlag = process.env.ENABLE_SLOTS_PLAY;
@@ -90,9 +92,12 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     });
     inspectSlots.mockResolvedValue({ mode: 'SLOTS_INSPECT', status: 'READ_ONLY_INSPECTION_COMPLETE', success: true, logs: '', screenshot: null });
     verifySubmissionEvidence.mockReturnValue(true);
+    const plannerMetricsDirectory = await mkdtemp(join(tmpdir(), 'hwb-planner-metrics-test-'));
+    plannerMetricsDirectories.push(plannerMetricsDirectory);
     server = createChatServer({ planMessage, prepareReview, runPlan, inspectSlots, checkSlotsReadiness, createSlotsEvidence, getActiveReview: () => activeReview,
       reviewStatus, submitReview, reviewIsReady, reviewRunnerAvailable, verifySubmissionEvidence,
-      getSubmissionEnabled: () => submissionEnabled });
+      getSubmissionEnabled: () => submissionEnabled,
+      plannerMetricsPath: join(plannerMetricsDirectory, 'planner-calls.jsonl') });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('NO_TEST_ADDRESS');
@@ -104,6 +109,7 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
       await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
     } finally {
       await Promise.all(evidenceDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+      await Promise.all(plannerMetricsDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
       if (previousSlotsPlayFlag === undefined) delete process.env.ENABLE_SLOTS_PLAY;
       else process.env.ENABLE_SLOTS_PLAY = previousSlotsPlayFlag;
     }
@@ -141,6 +147,38 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     expect((await post(cookie, '/api/run', { mode: 'BYPASS', instruction: 'Inspect' })).result.code).toBe('INVALID_MODE');
     expect(planMessage).not.toHaveBeenCalled();
     expect(runPlan).not.toHaveBeenCalled();
+  });
+  it('persists planner usage and outcomes without logging credentials', async () => {
+    const cookie = await session();
+    const instruction = `username: private-user password is private-pass ${'request '.repeat(30)}`;
+    planMessage
+      .mockResolvedValueOnce({ status: 'PLANNED', auth: false, plan: { actions: [{ type: 'get_page_info' }] },
+        usage: { source: 'reported', model: 'provider-model-id', reportedModel: 'provider-model-id', inputTokens: 12, outputTokens: 8, totalTokens: 20 } })
+      .mockResolvedValueOnce({ status: 'CLARIFICATION', reason: 'Please clarify', usage: { source: 'reported', model: 'provider-model-id', reportedModel: 'provider-model-id', inputTokens: 6 } })
+      .mockResolvedValueOnce({ status: 'BLOCKED', reason: 'Not allowed' })
+      .mockRejectedValueOnce(new Error('PLANNING_FAILED'));
+
+    await post(cookie, '/api/run', { instruction });
+    await post(cookie, '/api/run', { instruction: 'follow up request' });
+    await post(cookie, '/api/run', { instruction: 'blocked request' });
+    await post(cookie, '/api/run', { instruction: 'error request' });
+
+    const metricsDirectory = plannerMetricsDirectories.at(-1);
+    if (!metricsDirectory) throw new Error('MISSING_TEST_METRICS_DIRECTORY');
+    const rows = (await readFile(join(metricsDirectory, 'planner-calls.jsonl'), 'utf8'))
+      .trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
+    expect(rows).toHaveLength(4);
+    expect(rows[0]).toMatchObject({
+      requestText: expect.stringContaining('username=[REDACTED]'),
+      outcome: 'plan', model: 'provider-model-id', promptTokens: 12, completionTokens: 8, totalTokens: 20,
+    });
+    expect(rows[0].requestText).not.toContain('private-user');
+    expect(rows[0].requestText).not.toContain('private-pass');
+    expect(String(rows[0].requestText)).toHaveLength(200);
+    expect(rows.map((row) => row.outcome)).toEqual(['plan', 'follow-up question', 'blocked', 'error']);
+    expect(rows[1]).toMatchObject({ completionTokens: 'not recorded', totalTokens: 'not recorded' });
+    expect(rows[2]).toMatchObject({ promptTokens: 'not recorded', model: 'not recorded' });
+    expect(rows[3]).toMatchObject({ promptTokens: 'not recorded', model: 'not recorded' });
   });
   function interpretOnce(interpretation: SportsInterpretation) {
     planMessage.mockImplementationOnce(async (message: string, pending: PendingSportsRequest | null, state: SportsConversationState | null, messageId: string) =>

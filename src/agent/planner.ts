@@ -24,6 +24,7 @@ export interface PlannerOptions {
 export interface PlannerUsage {
   source: 'reported';
   model: string;
+  reportedModel?: string;
   inputTokens?: number;
   outputTokens?: number;
   totalTokens?: number;
@@ -31,10 +32,9 @@ export interface PlannerUsage {
 
 export type PlannerResult = PlannerResponse & { usage?: PlannerUsage };
 
-function readUsage(value: unknown, modelName: string): PlannerUsage | undefined {
+function readUsage(value: unknown, modelName: string, reportedModel?: string): PlannerUsage | undefined {
   try {
-  if (!value || typeof value !== 'object') return undefined;
-  const raw = value as Record<string, unknown>;
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {};
   const counts: Partial<Pick<PlannerUsage, 'inputTokens' | 'outputTokens' | 'totalTokens'>> = {};
   for (const [key, sourceKey] of [
     ['inputTokens', 'inputTokens'],
@@ -44,8 +44,8 @@ function readUsage(value: unknown, modelName: string): PlannerUsage | undefined 
     const count = raw[sourceKey];
     if (typeof count === 'number' && Number.isSafeInteger(count) && count >= 0) counts[key] = count;
   }
-  if (Object.keys(counts).length === 0) return undefined;
-  return { source: 'reported', model: modelName, ...counts };
+  if (Object.keys(counts).length === 0 && !reportedModel) return undefined;
+  return { source: 'reported', model: reportedModel ?? modelName, ...(reportedModel ? { reportedModel } : {}), ...counts };
   } catch {
     // Usage is advisory metadata; malformed provider objects must not affect planning.
     return undefined;
@@ -111,7 +111,7 @@ The model may prepare a slip only after the user clicks Confirm and run. It must
     } catch {
       throw new SportsInterpretationError('INVALID_INTERPRETATION');
     }
-    const usage = readUsage(generated.usage, this.modelName);
+    const usage = readUsage(generated.usage, this.modelName, generated.response?.modelId);
     return usage ? { interpretation, usage } : { interpretation };
     } catch (error) {
       if (error instanceof SportsInterpretationError) throw error;
@@ -340,7 +340,7 @@ Return JSON only.
 
       const text = generated.text.trim().replace(/^```(?:json)?\s*|\s*```$/gi, '');
       const response = PlannerResponseSchema.parse(JSON.parse(text));
-      const usage = readUsage(generated.usage, this.modelName);
+      const usage = readUsage(generated.usage, this.modelName, generated.response?.modelId);
       return usage ? { ...response, usage } : response;
 
     } catch (error) {

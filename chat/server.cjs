@@ -99,13 +99,51 @@ async function runMidsceneInspection(instruction) {
 
 function redactEvidenceText(text) {
   const secretNames = [
-    'MIDSCENE_MODEL_API_KEY', 'LLM_API_KEY',
+    'MIDSCENE_MODEL_API_KEY', 'LLM_API_KEY', 'OPENAI_API_KEY', 'PLANNER_API_KEY', 'VISION_API_KEY',
     'E2E_USER_HB_TEST_USERNAME', 'E2E_USER_HB_TEST_PASSWORD',
   ];
   return secretNames.reduce((safe, name) => {
     const secret = process.env[name];
     return secret ? safe.replaceAll(secret, '[REDACTED]') : safe;
   }, text);
+}
+
+function redactPlannerRequest(text) {
+  return redactEvidenceText(text)
+    .replace(/\bBearer\s+[^\s,;]+/gi, 'Bearer [REDACTED]')
+    .replace(/(?:["']?)(password|passcode|username|user name|email|api[-_ ]?key|authorization)(?:["']?)\s*[:=]\s*["']?[^"'\s,;}]+["']?/gi, '$1=[REDACTED]')
+    .replace(/\b(password|passcode|username|user name|email|api[-_ ]?key|authorization)\b\s+(?:is\s+)?[^\s,;]+/gi, '$1=[REDACTED]')
+    .replace(/\/\/[^/@\s:]+:[^/@\s]+@/g, '//[REDACTED]@')
+    .slice(0, 200);
+}
+
+function plannerOutcome(result) {
+  if (result?.status === 'PLANNED') return 'plan';
+  if (result?.status === 'BLOCKED') return 'blocked';
+  if (['CLARIFICATION', 'AMBIGUOUS', 'UNRELATED', 'CANCELLED', 'EXPIRED', 'UNCHANGED'].includes(result?.status)) {
+    return 'follow-up question';
+  }
+  return 'error';
+}
+
+async function appendPlannerMetrics(filePath, instruction, result, outcome, latencyMs) {
+  const usage = result?.usage;
+  const row = {
+    timestamp: new Date().toISOString(),
+    requestText: redactPlannerRequest(instruction),
+    outcome,
+    promptTokens: Number.isSafeInteger(usage?.inputTokens) ? usage.inputTokens : 'not recorded',
+    completionTokens: Number.isSafeInteger(usage?.outputTokens) ? usage.outputTokens : 'not recorded',
+    totalTokens: Number.isSafeInteger(usage?.totalTokens) ? usage.totalTokens : 'not recorded',
+    latencyMs,
+    model: usage?.source === 'reported' && typeof usage.reportedModel === 'string' ? usage.reportedModel : 'not recorded',
+  };
+  try {
+    await mkdir(path.dirname(filePath), { recursive: true });
+    await appendFile(filePath, JSON.stringify(row) + '\n', 'utf8');
+  } catch (error) {
+    console.error('[Planner metrics] Unable to append usage record:', error instanceof Error ? error.message : 'write failed');
+  }
 }
 
 async function createSlotRunEvidence(plan) {
@@ -629,6 +667,7 @@ function createChatServer({ planMessage = planInstruction, prepareReview = start
   checkSlotsReadiness = runSlotsModelReadiness,
   createSlotsEvidence = createSlotRunEvidence,
   getActiveReview = () => activeReview, reviewStatus = readReviewStatus,
+  plannerMetricsPath = path.join(PROJECT, 'reports', 'metrics', 'planner-calls.jsonl'),
   reviewIsReady = (review) => reviews.get(review.id)?.state === 'ready',
   reviewRunnerAvailable = (review) => Boolean(review.reviewDecisionPath && review.submissionResultPath && !review.terminal),
   getSubmissionEnabled = () => process.env.ENABLE_SPORTS_SUBMISSION === '1',
@@ -967,7 +1006,15 @@ return http.createServer(async (req, res) => {
     }
     const messageId = payload.messageId || randomUUID();
     rememberMessage(session, { id: 'user-' + messageId, role: 'user', text: instruction });
-    const result = await planMessage(instruction, session.pendingSports, session.conversationState, messageId);
+    const planningStartedAt = Date.now();
+    let result;
+    try {
+      result = await planMessage(instruction, session.pendingSports, session.conversationState, messageId);
+    } catch (error) {
+      await appendPlannerMetrics(plannerMetricsPath, instruction, null, 'error', Date.now() - planningStartedAt);
+      throw error;
+    }
+    await appendPlannerMetrics(plannerMetricsPath, instruction, result, plannerOutcome(result), Date.now() - planningStartedAt);
     if (Object.hasOwn(result, 'pendingSports')) {
       confirmationInvalidated = Boolean(result.confirmationInvalidated ?? result.changed);
       if (confirmationInvalidated) clearSportsConfirmations(session);

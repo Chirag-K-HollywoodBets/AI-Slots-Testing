@@ -56,6 +56,7 @@ describe('Planner', () => {
     mockGenerateText.mockResolvedValue({
       text: JSON.stringify(mockPlan),
       usage: { inputTokens: 12, outputTokens: 8, totalTokens: 20 },
+      response: { modelId: 'reported-model-id' },
     });
 
     const result = await planner.plan(
@@ -63,7 +64,7 @@ describe('Planner', () => {
     );
 
     expect(result).toEqual({ ...mockPlan, usage: {
-      source: 'reported', model: 'test-model', inputTokens: 12, outputTokens: 8, totalTokens: 20,
+      source: 'reported', model: 'reported-model-id', reportedModel: 'reported-model-id', inputTokens: 12, outputTokens: 8, totalTokens: 20,
     } });
 
     expect(mockGenerateText).toHaveBeenCalledWith(
@@ -79,6 +80,14 @@ describe('Planner', () => {
     const object = { thought: 'Inspect', actions: [{ type: 'get_page_info' }] };
     mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify(object) });
     expect(await planner.plan('Inspect')).toEqual(object);
+  });
+
+  it('records a provider-reported model even when token counts are omitted', async () => {
+    const object = { thought: 'Inspect', actions: [{ type: 'get_page_info' }] };
+    mockGenerateText.mockResolvedValueOnce({ text: JSON.stringify(object), response: { modelId: 'actual-model' } });
+    expect(await planner.plan('Inspect')).toEqual({ ...object, usage: {
+      source: 'reported', model: 'actual-model', reportedModel: 'actual-model',
+    } });
   });
 
   it('ignores malformed usage fields without failing planning', async () => {

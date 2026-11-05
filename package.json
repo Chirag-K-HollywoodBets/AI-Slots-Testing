@@ -9,6 +9,7 @@
     "typecheck": "tsc --noEmit",
     "test:e2e": "e2e run",
     "test:agent": "vitest run tests/agent",
+    "metrics": "tsx scripts/metrics/collect-llm-metrics.ts",
     "midscene:inspect-slots": "tsx scripts/midscene/inspect-olympus.ts",
     "midscene:check-model": "tsx scripts/midscene/inspect-olympus.ts --check-model"
   },
