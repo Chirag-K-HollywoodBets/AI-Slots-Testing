@@ -3,7 +3,7 @@ import type { Server } from 'node:http';
 import { request as httpRequest } from 'node:http';
 import { mkdtemp, writeFile, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { reduceSportsConversation, type PendingSportsRequest, type SportsInterpretation, type SportsConversationState } from '../../src/agent/sports-conversation';
 import { interpretSportsTurn } from '../../src/agent/sports-interpreter';
 
@@ -21,7 +21,7 @@ const { createChatServer } = require('../../chat/server.cjs') as { createChatSer
   getSubmissionEnabled?: () => boolean;
   reviewRunnerAvailable?: (...args: unknown[]) => boolean;
   verifySubmissionEvidence?: (...args: unknown[]) => boolean;
-  plannerMetricsPath?: string;
+  plannerMetricsSource?: string;
 }) => Server };
 const quote = (value: string) => ({ value, evidence: value });
 const complete: SportsInterpretation = { kind: 'new_request', updates: {
@@ -68,11 +68,14 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
   let submissionEnabled = false;
   let activeReview: any;
   let previousSlotsPlayFlag: string | undefined;
+  let previousPlannerMetricsLog: string | undefined;
+  let plannerMetricsPath: string;
   const evidenceDirectories: string[] = [];
   const plannerMetricsDirectories: string[] = [];
 
   beforeEach(async () => {
     previousSlotsPlayFlag = process.env.ENABLE_SLOTS_PLAY;
+    previousPlannerMetricsLog = process.env.PLANNER_METRICS_LOG;
     delete process.env.ENABLE_SLOTS_PLAY;
     vi.resetAllMocks();
     submissionEnabled = false;
@@ -94,10 +97,11 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     verifySubmissionEvidence.mockReturnValue(true);
     const plannerMetricsDirectory = await mkdtemp(join(tmpdir(), 'hwb-planner-metrics-test-'));
     plannerMetricsDirectories.push(plannerMetricsDirectory);
+    plannerMetricsPath = join(plannerMetricsDirectory, 'planner-calls.jsonl');
+    process.env.PLANNER_METRICS_LOG = plannerMetricsPath;
     server = createChatServer({ planMessage, prepareReview, runPlan, inspectSlots, checkSlotsReadiness, createSlotsEvidence, getActiveReview: () => activeReview,
       reviewStatus, submitReview, reviewIsReady, reviewRunnerAvailable, verifySubmissionEvidence,
-      getSubmissionEnabled: () => submissionEnabled,
-      plannerMetricsPath: join(plannerMetricsDirectory, 'planner-calls.jsonl') });
+      getSubmissionEnabled: () => submissionEnabled, plannerMetricsSource: 'test' });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
     if (!address || typeof address === 'string') throw new Error('NO_TEST_ADDRESS');
@@ -112,6 +116,8 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
       await Promise.all(plannerMetricsDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
       if (previousSlotsPlayFlag === undefined) delete process.env.ENABLE_SLOTS_PLAY;
       else process.env.ENABLE_SLOTS_PLAY = previousSlotsPlayFlag;
+      if (previousPlannerMetricsLog === undefined) delete process.env.PLANNER_METRICS_LOG;
+      else process.env.PLANNER_METRICS_LOG = previousPlannerMetricsLog;
     }
   });
   async function session(): Promise<string> {
@@ -163,12 +169,13 @@ describe('chat conversation HTTP contract (stubbed planner and runner)', () => {
     await post(cookie, '/api/run', { instruction: 'blocked request' });
     await post(cookie, '/api/run', { instruction: 'error request' });
 
-    const metricsDirectory = plannerMetricsDirectories.at(-1);
-    if (!metricsDirectory) throw new Error('MISSING_TEST_METRICS_DIRECTORY');
-    const rows = (await readFile(join(metricsDirectory, 'planner-calls.jsonl'), 'utf8'))
+    const defaultMetricsPath = resolve(process.cwd(), 'reports', 'metrics', 'planner-calls.jsonl');
+    expect(plannerMetricsPath).not.toBe(defaultMetricsPath);
+    const rows = (await readFile(plannerMetricsPath, 'utf8'))
       .trim().split(/\r?\n/).map((line) => JSON.parse(line) as Record<string, unknown>);
     expect(rows).toHaveLength(4);
     expect(rows[0]).toMatchObject({
+      source: 'test',
       requestText: expect.stringContaining('username=[REDACTED]'),
       outcome: 'plan', model: 'provider-model-id', promptTokens: 12, completionTokens: 8, totalTokens: 20,
     });

@@ -25,6 +25,8 @@ interface ScanCounts {
   traceFiles: number;
   tokenUsageLines: number;
   structuredUsageRecords: number;
+  plannerLiveRecords: number;
+  plannerIgnoredRecords: number;
 }
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -42,6 +44,8 @@ const counts: ScanCounts = {
   traceFiles: 0,
   tokenUsageLines: 0,
   structuredUsageRecords: 0,
+  plannerLiveRecords: 0,
+  plannerIgnoredRecords: 0,
 };
 
 function recordNumber(value: unknown): MetricNumber {
@@ -381,6 +385,11 @@ async function scanPlannerCalls(): Promise<void> {
       const row: unknown = JSON.parse(line);
       if (!row || typeof row !== 'object') continue;
       const record = row as Record<string, unknown>;
+      if (record.source !== 'live') {
+        counts.plannerIgnoredRecords++;
+        continue;
+      }
+      counts.plannerLiveRecords++;
       const numeric = (value: unknown): MetricNumber => value === 'not recorded' ? null : recordNumber(value);
       calls.push({
         timestamp: toTimestamp(record.timestamp),
@@ -424,6 +433,13 @@ function sum(values: MetricNumber[]): number | null {
 function average(values: MetricNumber[]): number | null {
   const recorded = values.filter((value): value is number => value !== null);
   return recorded.length ? recorded.reduce((total, value) => total + value, 0) / recorded.length : null;
+}
+
+function median(values: number[]): number | null {
+  if (!values.length) return null;
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = Math.floor(sorted.length / 2);
+  return sorted.length % 2 === 1 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
 }
 
 function markdownTable(rows: string[][]): string {
@@ -493,6 +509,17 @@ function buildSummary(): string {
   const plannerOutcomeSummary = plannerOutcomes.size
     ? [...plannerOutcomes.entries()].map(([outcome, count]) => `${outcome}: ${count}`).join('; ')
     : 'not recorded';
+  const plannerByOutcome = new Map<string, LlmCall[]>();
+  for (const call of plannerCalls) {
+    const group = plannerByOutcome.get(call.outcome) ?? [];
+    group.push(call);
+    plannerByOutcome.set(call.outcome, group);
+  }
+  const plannerOutcomeGroups = new Map([...plannerByOutcome.entries()]
+    .sort(([a], [b]) => a.localeCompare(b)));
+  const recordedPlannerLatencies = plannerCalls
+    .map((call) => call.latencyMs)
+    .filter((value): value is number => value !== null);
 
   const tokenlessText = tokenlessTypes.length
     ? tokenlessTypes.map(({ phase, count }) => `- ${phase}: ${count} call(s) have no prompt/completion/total token fields recorded.`).join('\n')
@@ -512,8 +539,8 @@ function buildSummary(): string {
     `- Slot reports: ${counts.slotReports} report.json file(s), ${counts.slotLogs} run.log file(s).`,
     `- E2E/trace text outputs: ${counts.traceFiles} file(s); token-usage text records: ${counts.tokenUsageLines}.`,
     `- Structured token-usage records outside Midscene HTML: ${counts.structuredUsageRecords}.`,
-    `- Total extracted calls: ${calls.length}.`,
-    `- Planner JSONL records: ${plannerCalls.length}.`,
+    `- Planner JSONL records: ${counts.plannerLiveRecords} live included; ${counts.plannerIgnoredRecords} non-live or missing-source ignored.`,
+    `- Total extracted calls, including live planner rows only: ${calls.length}.`,
     '',
     '## Totals and averages',
     '',
@@ -538,10 +565,12 @@ function buildSummary(): string {
     '## Planner calls',
     '',
     `- Calls: ${plannerCalls.length}; outcomes: ${plannerOutcomeSummary}.`,
-    `- Prompt tokens: recorded sum ${formatNumber(sum(plannerCalls.map((call) => call.promptTokens)))}; average ${formatNumber(average(plannerCalls.map((call) => call.promptTokens)))}.`,
-    `- Completion tokens: recorded sum ${formatNumber(sum(plannerCalls.map((call) => call.completionTokens)))}; average ${formatNumber(average(plannerCalls.map((call) => call.completionTokens)))}.`,
-    `- Total tokens: recorded sum ${formatNumber(sum(plannerCalls.map((call) => call.totalTokens)))}; average ${formatNumber(average(plannerCalls.map((call) => call.totalTokens)))}.`,
-    `- Latency: average of recorded values ${formatNumber(average(plannerCalls.map((call) => call.latencyMs)))} ms.`,
+    '',
+    '### Averages by outcome',
+    '',
+    groupTable(plannerOutcomeGroups),
+    '',
+    `- Latency min / median / max: ${formatNumber(recordedPlannerLatencies.length ? Math.min(...recordedPlannerLatencies) : null)} / ${formatNumber(median(recordedPlannerLatencies))} / ${formatNumber(recordedPlannerLatencies.length ? Math.max(...recordedPlannerLatencies) : null)} ms (recorded values only).`,
     '',
     '## Call types without token data',
     '',

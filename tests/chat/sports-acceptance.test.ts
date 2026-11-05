@@ -1,5 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Server } from 'node:http';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 const { generate } = vi.hoisted(() => ({ generate: vi.fn() }));
 vi.mock('ai', () => ({ generateText: generate }));
 import { Planner } from '../../src/agent/planner';
@@ -22,17 +25,24 @@ describe('sports conversations A–E through real planner validation and HTTP (m
   let base: string;
   let cookie: string;
   let fixtureSnapshot: FixtureSnapshot | null;
+  let previousPlannerMetricsLog: string | undefined;
+  const plannerMetricsDirectories: string[] = [];
   const prepareReview = vi.fn();
   const runPlan = vi.fn();
   beforeEach(async () => {
+    previousPlannerMetricsLog = process.env.PLANNER_METRICS_LOG;
     generate.mockReset(); prepareReview.mockReset(); runPlan.mockReset();
     prepareReview.mockResolvedValue({ id: 'mock-review' });
     fixtureSnapshot = null;
+    const plannerMetricsDirectory = await mkdtemp(join(tmpdir(), 'hwb-sports-planner-metrics-test-'));
+    plannerMetricsDirectories.push(plannerMetricsDirectory);
+    process.env.PLANNER_METRICS_LOG = join(plannerMetricsDirectory, 'planner-calls.jsonl');
     const planner = new Planner({ baseUrl: 'http://unused.invalid/v1', modelName: 'mock-local-model', customModel: {}, interpretationTimeoutMs: 100 });
     server = createChatServer({
       planMessage: (message: string, pending: PendingSportsRequest | null, state: SportsConversationState | null, messageId: string) =>
         interpretSportsTurn(planner, message, pending, { state: state ?? undefined, messageId, fixtureSnapshot }),
       prepareReview, runPlan, getActiveReview: () => null,
+      plannerMetricsSource: 'test',
     });
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
     const address = server.address();
@@ -43,6 +53,9 @@ describe('sports conversations A–E through real planner validation and HTTP (m
   afterEach(async () => {
     server.closeAllConnections();
     await new Promise<void>((resolve, reject) => server.close((error) => error ? reject(error) : resolve()));
+    await Promise.all(plannerMetricsDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
+    if (previousPlannerMetricsLog === undefined) delete process.env.PLANNER_METRICS_LOG;
+    else process.env.PLANNER_METRICS_LOG = previousPlannerMetricsLog;
   });
   async function session() {
     const response = await fetch(base);

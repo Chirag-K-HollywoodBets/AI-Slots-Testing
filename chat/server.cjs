@@ -126,9 +126,10 @@ function plannerOutcome(result) {
   return 'error';
 }
 
-async function appendPlannerMetrics(filePath, instruction, result, outcome, latencyMs) {
+async function appendPlannerMetrics(filePath, instruction, result, outcome, latencyMs, source) {
   const usage = result?.usage;
   const row = {
+    source,
     timestamp: new Date().toISOString(),
     requestText: redactPlannerRequest(instruction),
     outcome,
@@ -667,7 +668,10 @@ function createChatServer({ planMessage = planInstruction, prepareReview = start
   checkSlotsReadiness = runSlotsModelReadiness,
   createSlotsEvidence = createSlotRunEvidence,
   getActiveReview = () => activeReview, reviewStatus = readReviewStatus,
-  plannerMetricsPath = path.join(PROJECT, 'reports', 'metrics', 'planner-calls.jsonl'),
+  plannerMetricsPath = process.env.PLANNER_METRICS_LOG
+    ? path.resolve(PROJECT, process.env.PLANNER_METRICS_LOG)
+    : path.join(PROJECT, 'reports', 'metrics', 'planner-calls.jsonl'),
+  plannerMetricsSource = 'live',
   reviewIsReady = (review) => reviews.get(review.id)?.state === 'ready',
   reviewRunnerAvailable = (review) => Boolean(review.reviewDecisionPath && review.submissionResultPath && !review.terminal),
   getSubmissionEnabled = () => process.env.ENABLE_SPORTS_SUBMISSION === '1',
@@ -1011,10 +1015,10 @@ return http.createServer(async (req, res) => {
     try {
       result = await planMessage(instruction, session.pendingSports, session.conversationState, messageId);
     } catch (error) {
-      await appendPlannerMetrics(plannerMetricsPath, instruction, null, 'error', Date.now() - planningStartedAt);
+      await appendPlannerMetrics(plannerMetricsPath, instruction, null, 'error', Date.now() - planningStartedAt, plannerMetricsSource);
       throw error;
     }
-    await appendPlannerMetrics(plannerMetricsPath, instruction, result, plannerOutcome(result), Date.now() - planningStartedAt);
+    await appendPlannerMetrics(plannerMetricsPath, instruction, result, plannerOutcome(result), Date.now() - planningStartedAt, plannerMetricsSource);
     if (Object.hasOwn(result, 'pendingSports')) {
       confirmationInvalidated = Boolean(result.confirmationInvalidated ?? result.changed);
       if (confirmationInvalidated) clearSportsConfirmations(session);
