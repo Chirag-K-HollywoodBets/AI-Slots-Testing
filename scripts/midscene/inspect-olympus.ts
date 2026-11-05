@@ -4,7 +4,11 @@ import { readFile } from 'node:fs/promises';
 import { pathToFileURL } from 'node:url';
 import { ALLOWED_GAMES } from '../../src/agent/schema';
 import { isDoSpinRequest } from '../../src/agent/midscene-slot-guard';
-import { configureMidsceneModel } from '../../src/agent/midscene-model';
+import {
+  buildMidsceneModelsUrl,
+  configureMidsceneModel,
+  validateMidsceneModelsPayload,
+} from '../../src/agent/midscene-model';
 
 const SITE_ORIGIN = 'https://www.hollywoodbets.net';
 const CDP_ENDPOINT = 'http://127.0.0.1:9223';
@@ -26,14 +30,51 @@ async function main(): Promise<void> {
       return;
     }
     try {
-      const response = await fetch(new URL('/models', baseUrl), { headers: process.env.MIDSCENE_MODEL_API_KEY
-        ? { Authorization: 'Bearer ' + process.env.MIDSCENE_MODEL_API_KEY } : {}, signal: AbortSignal.timeout(5000) });
-      const payload = await response.json().catch(() => ({})) as { data?: Array<{ id?: string }> };
-      const available = response.ok && (!Array.isArray(payload.data) || payload.data.some((entry) => entry.id === model));
-      console.log(JSON.stringify({ status: available ? 'MODEL_READY' : 'MODEL_UNAVAILABLE', success: available,
-        model, endpoint: baseUrl, ...(available ? {} : { error: 'MODEL_UNAVAILABLE' }) }));
-    } catch {
-      console.log(JSON.stringify({ status: 'MODEL_UNAVAILABLE', success: false, error: 'MODEL_UNAVAILABLE', model, endpoint: baseUrl }));
+      const apiKey = process.env.MIDSCENE_MODEL_API_KEY;
+      const endpoint = buildMidsceneModelsUrl(baseUrl);
+      const response = await fetch(endpoint, {
+        headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
+        signal: AbortSignal.timeout(5000),
+      });
+      const responseBody = await response.text();
+      if (!response.ok) {
+        const redactedBody = apiKey ? responseBody.replaceAll(apiKey, '[REDACTED]') : responseBody;
+        const bodyPreview = redactedBody.slice(0, 300);
+        const reason = `HTTP ${response.status}${response.statusText ? ` ${response.statusText}` : ''}: ${bodyPreview}`;
+        console.log(JSON.stringify({ status: 'MODEL_UNAVAILABLE', success: false, error: 'MODEL_UNAVAILABLE', reason, model, endpoint: endpoint.href }));
+        return;
+      }
+
+      const result = validateMidsceneModelsPayload(responseBody, model);
+      console.log(JSON.stringify({
+        status: result.available ? 'MODEL_READY' : 'MODEL_UNAVAILABLE',
+        success: result.available,
+        model,
+        endpoint: endpoint.href,
+        ...(result.available ? {} : { error: 'MODEL_UNAVAILABLE', reason: result.reason }),
+      }));
+    } catch (error) {
+      const errorName = error instanceof Error ? error.name : typeof error;
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorCause = error instanceof Error && error.cause !== undefined
+        ? error.cause instanceof Error
+          ? `${error.cause.name}: ${error.cause.message}`
+          : String(error.cause)
+        : undefined;
+      const apiKey = process.env.MIDSCENE_MODEL_API_KEY;
+      const redact = (value: string) => apiKey ? value.replaceAll(apiKey, '[REDACTED]') : value;
+      console.log(JSON.stringify({
+        status: 'MODEL_UNAVAILABLE',
+        success: false,
+        error: 'MODEL_UNAVAILABLE',
+        reason: {
+          name: errorName,
+          message: redact(errorMessage),
+          cause: errorCause === undefined ? null : redact(errorCause),
+        },
+        model,
+        endpoint: baseUrl,
+      }));
     }
     return;
   }

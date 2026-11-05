@@ -16,6 +16,32 @@ export interface MidsceneModelOptions {
   allowLegacyLlmAliases?: boolean;
 }
 
+export function buildMidsceneModelsUrl(baseUrl: string): URL {
+  return new URL('models', baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`);
+}
+
+export function validateMidsceneModelsPayload(
+  payloadText: string,
+  modelName: string,
+): { available: boolean; reason?: string } {
+  let payload: unknown;
+  try {
+    payload = JSON.parse(payloadText);
+  } catch {
+    return { available: false, reason: 'Response body is not valid JSON.' };
+  }
+
+  if (!payload || typeof payload !== 'object' || !('data' in payload) || !Array.isArray(payload.data)) {
+    return { available: false, reason: 'Response JSON does not contain a data array.' };
+  }
+
+  const hasModel = payload.data.some((entry: unknown) =>
+    Boolean(entry && typeof entry === 'object' && 'id' in entry && entry.id === modelName));
+  return hasModel
+    ? { available: true }
+    : { available: false, reason: 'Configured model ID was not found in the response data.' };
+}
+
 export function configureMidsceneModel(
   env: NodeJS.ProcessEnv = process.env,
   options: MidsceneModelOptions = {},

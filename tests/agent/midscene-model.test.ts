@@ -2,11 +2,38 @@ import { describe, expect, it } from 'vitest';
 import { classifyMidsceneError } from '../../scripts/midscene/inspect-olympus';
 import {
   configureMidsceneModel,
+  buildMidsceneModelsUrl,
   logMidsceneModelConfig,
   MIDSCENE_VISION_DEFAULTS,
+  validateMidsceneModelsPayload,
 } from '../../src/agent/midscene-model';
 
 describe('Midscene VLM readiness/error classification', () => {
+  it.each([
+    ['base without trailing slash', 'http://vision.example', 'http://vision.example/models'],
+    ['base with trailing slash', 'http://vision.example/', 'http://vision.example/models'],
+    ['base path', 'http://vision.example/gemma/v1', 'http://vision.example/gemma/v1/models'],
+  ])('joins the models path for a %s', (_label, baseUrl, expected) => {
+    expect(buildMidsceneModelsUrl(baseUrl).href).toBe(expected);
+  });
+
+  it.each([
+    ['invalid JSON', '{not-json}', 'Response body is not valid JSON.'],
+    ['missing data array', '{"models":[]}', 'Response JSON does not contain a data array.'],
+  ])('fails closed for %s', (_label, payload, reason) => {
+    expect(validateMidsceneModelsPayload(payload, 'vision-model')).toEqual({ available: false, reason });
+  });
+
+  it('accepts a data array containing the configured model ID', () => {
+    expect(validateMidsceneModelsPayload('{"data":[{"id":"vision-model"}]}', 'vision-model'))
+      .toEqual({ available: true });
+  });
+
+  it('rejects a data array containing only a different model ID', () => {
+    expect(validateMidsceneModelsPayload('{"data":[{"id":"another-model"}]}', 'vision-model'))
+      .toEqual({ available: false, reason: 'Configured model ID was not found in the response data.' });
+  });
+
   it('prefers explicit MIDSCENE variables over legacy aliases', () => {
     const env: NodeJS.ProcessEnv = {
       MIDSCENE_MODEL_BASE_URL: 'http://vision.example/v1',
