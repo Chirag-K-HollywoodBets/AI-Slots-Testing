@@ -13,7 +13,7 @@ import { executePlan, type ActionResult, type SuccessfulPlaySlotActionResult } f
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
 import { parseRand, settleSlotObservation, type SlotObservation } from '../src/agent/slot-settlement';
-import { headerBalanceLagError, pollHeaderBalance, structuredSlotError } from '../src/agent/slot-run-control';
+import { headerBalanceLagError, headerBalanceUnreadableError, leaveGameThenPollHeaderBalance, structuredSlotError } from '../src/agent/slot-run-control';
 import { configureMidsceneModel, logMidsceneModelConfig } from '../src/agent/midscene-model';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
@@ -182,6 +182,7 @@ test(
     const balanceBeforeState: { value: number | null } = { value: null };
     const balanceAfterState: { value: number | null } = { value: null };
     let midsceneBalance: number | null = null;
+    let midsceneBalanceCheck: { status: 'match' | 'mismatch' | 'unavailable'; value?: number; errorName?: string } | null = null;
     let midsceneFailure: { step: string; spin: number | null } | null = null;
     try {
       const midscene = await runPhase('Attach read-only Midscene to the runner page', async () => {
@@ -374,48 +375,69 @@ test(
         },
       };
 
-      const balanceAfterText = await runPhase('Read header balance after the spins and compare', async () => {
-        await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
-        const serverBalance = slotObservation.finalBalance;
-        if (serverBalance === null || !Number.isFinite(serverBalance)) throw new Error('BALANCE_NOT_REPORTED');
-        if (Math.round(serverBalance * 100) !== Math.round(settlement.expectedBalance * 100)) {
-          throw new Error('BALANCE_MISMATCH');
-        }
-        const polled = await pollHeaderBalance(async () => {
-          const value = (await balanceLocator.textContent())?.trim() ?? '';
-          return parseRand(value);
-        }, serverBalance, { timeoutMs: 10_000, intervalMs: 500 });
-        console.log(`Balance after (header poll): expectedServer=R${serverBalance.toFixed(2)} lastHeader=${polled.lastValue === null ? 'unreadable' : `R${polled.lastValue.toFixed(2)}`} matched=${polled.matched}`);
-        balanceAfterState.value = serverBalance;
-        if (!polled.matched) {
-          const lag = headerBalanceLagError(polled.lastValue, serverBalance);
-          await saveReport({ status: 'FAIL', success: false, error: structuredSlotError(lag, 'header-balance-poll'), durationMs,
-            plan, balanceBefore, balanceAfter: serverBalance, headerBalanceLast: polled.lastValue, gameState, spinResults, actions: actionReports });
-          throw lag;
-        }
-        try {
-          const visual = await midscene.aiQuery(
-            '{ balance: number }, read the current in-game balance shown in the game canvas as a secondary cross-check only. Return only the numeric balance, without currency symbols.'
-          ) as unknown;
-          const visualValue = typeof visual === 'object' && visual !== null && 'balance' in visual
-            ? (visual as { balance: unknown }).balance
-            : visual;
-          midsceneBalance = parseRand(typeof visualValue === 'string' || typeof visualValue === 'number' ? visualValue : null);
-          console.log(`Balance secondary cross-check (Midscene): ${JSON.stringify(visual)} => R${midsceneBalance.toFixed(2)}; authoritative=doSpin response`);
-        } catch (error) {
-          console.log(`Balance secondary cross-check unavailable: ${error instanceof Error ? error.name : typeof error}; authoritative=doSpin response`);
-        }
+      const serverBalance = slotObservation.finalBalance;
+      if (serverBalance === null || !Number.isFinite(serverBalance)) throw new Error('BALANCE_NOT_REPORTED');
+      if (Math.round(serverBalance * 100) !== Math.round(settlement.expectedBalance * 100)) {
+        throw new Error('BALANCE_MISMATCH');
+      }
 
-        const balanceAfter = serverBalance;
-        console.log(`Balance settlement: before=R${settledBalanceBefore.toFixed(2)} spins=${spinResults.length} staked=R${settlement.totalStaked.toFixed(2)} totalWon=R${settlement.totalWon.toFixed(2)} expected=R${settlement.expectedBalance.toFixed(2)} server=R${serverBalance.toFixed(2)} header=${polled.lastValue === null ? 'unreadable' : `R${polled.lastValue.toFixed(2)}`}`);
-        const settlementEvidence = evidenceState.settlement as Record<string, unknown>;
-        evidenceState = {
-          ...evidenceState,
-          balanceAfter,
-          settlement: { ...settlementEvidence, actualBalance: balanceAfter },
-        };
-        return polled.lastValue!.toFixed(2);
+      // Read the in-game display before leaving, but use it only as report evidence.
+      try {
+        const visual = await midscene.aiQuery(
+          '{ balance: number }, read the current in-game balance shown in the game canvas as a secondary cross-check only. Return only the numeric balance, without currency symbols.'
+        ) as unknown;
+        const visualValue = typeof visual === 'object' && visual !== null && 'balance' in visual
+          ? (visual as { balance: unknown }).balance
+          : visual;
+        midsceneBalance = parseRand(typeof visualValue === 'string' || typeof visualValue === 'number' ? visualValue : null);
+        const matches = Math.round(midsceneBalance * 100) === Math.round(serverBalance * 100);
+        midsceneBalanceCheck = { status: matches ? 'match' : 'mismatch', value: midsceneBalance };
+        console.log(`Balance in-game cross-check: value=R${midsceneBalance.toFixed(2)} server=R${serverBalance.toFixed(2)} status=${midsceneBalanceCheck.status}; authoritative=doSpin response`);
+      } catch (error) {
+        midsceneBalanceCheck = { status: 'unavailable', errorName: error instanceof Error ? error.name : typeof error };
+        console.log(`Balance in-game cross-check unavailable: ${midsceneBalanceCheck.errorName}; authoritative=doSpin response`);
+      }
+      evidenceState = { ...evidenceState, midsceneBalanceCheck };
+      await saveReport({ midsceneBalanceCheck, ...(midsceneBalance === null ? {} : { midsceneBalance }) });
+
+      const polled = await runPhase('Leave the game and poll the lobby header balance', async () => {
+        return leaveGameThenPollHeaderBalance(
+          () => adapter.leaveSlotGame(),
+          async () => {
+            let value = 'unreadable';
+            try {
+              value = (await balanceLocator.textContent())?.trim() ?? '';
+              const parsed = parseRand(value);
+              console.log(`Lobby header balance read: text=${JSON.stringify(value)} value=R${parsed.toFixed(2)} server=R${serverBalance.toFixed(2)}`);
+              return parsed;
+            } catch (error) {
+              console.log(`Lobby header balance read: text=${JSON.stringify(value)} unreadable=${error instanceof Error ? error.message : String(error)} server=R${serverBalance.toFixed(2)}`);
+              throw error;
+            }
+          },
+          serverBalance,
+          { timeoutMs: 20_000, intervalMs: 500 },
+        );
       });
+      console.log(`Balance after lobby poll: server=R${serverBalance.toFixed(2)} lastHeader=${polled.lastValue === null ? 'unreadable' : `R${polled.lastValue.toFixed(2)}`} matched=${polled.matched}`);
+      if (!polled.matched) {
+        const failure = polled.lastValue === null
+          ? headerBalanceUnreadableError(serverBalance)
+          : headerBalanceLagError(polled.lastValue, serverBalance);
+        await saveReport({ status: 'FAIL', success: false, error: structuredSlotError(failure, 'header-balance-poll'),
+          reason: failure.code, durationMs, plan, balanceBefore, balanceAfter: serverBalance,
+          headerBalanceLast: polled.lastValue, midsceneBalanceCheck, gameState, spinResults, actions: actionReports });
+        throw failure;
+      }
+      balanceAfterState.value = serverBalance;
+      console.log(`Balance settlement: before=R${settledBalanceBefore.toFixed(2)} spins=${spinResults.length} staked=R${settlement.totalStaked.toFixed(2)} totalWon=R${settlement.totalWon.toFixed(2)} expected=R${settlement.expectedBalance.toFixed(2)} server=R${serverBalance.toFixed(2)} header=R${polled.lastValue?.toFixed(2)}`);
+      const settlementEvidence = evidenceState.settlement as Record<string, unknown>;
+      evidenceState = {
+        ...evidenceState,
+        balanceAfter: serverBalance,
+        settlement: { ...settlementEvidence, actualBalance: serverBalance },
+      };
+      const balanceAfterText = polled.lastValue?.toFixed(2) ?? '';
       const balanceAfter = balanceAfterState.value;
       if (balanceAfter === null) throw new Error('BALANCE_AFTER_INVALID');
 
@@ -443,6 +465,7 @@ test(
           actualBalance: balanceAfter,
         },
         ...(midsceneBalance === null ? {} : { midsceneBalance }),
+        ...(midsceneBalanceCheck === null ? {} : { midsceneBalanceCheck }),
         actions: actionReports,
       };
 

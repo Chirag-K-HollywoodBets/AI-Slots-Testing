@@ -234,7 +234,7 @@ export function createE2EBrowserAdapter(
   midscene?: ReadOnlyMidscene,
   onSpinSettlement?: (event: { spin: number; responseIndex: number; serverFields: GameResponse['serverFields']; doSpinRequestsSent: number; doSpinResponsesReceived: number }) => Promise<void> | void,
   responsePage?: Pick<Page, 'on' | 'off'>,
-): BrowserAdapter {
+): BrowserAdapter & { leaveSlotGame(): Promise<void> } {
   const origin = new URL(allowedOrigin).origin;
  
   async function verifyOrigin(): Promise<void> {
@@ -294,6 +294,7 @@ export function createE2EBrowserAdapter(
     attempted: number;
     expectedSpins: number | null;
   } | null = null;
+  let slotRunSettled = false;
  
   /** Collects every game-service response for one spin until the game goes quiet. */
   async function collectSpin(
@@ -327,7 +328,7 @@ export function createE2EBrowserAdapter(
     return responses;
   }
  
-  const adapter: BrowserAdapter = {
+  const adapter: BrowserAdapter & { leaveSlotGame(): Promise<void> } = {
     async getPageInfo() {
       await verifyOrigin();
  
@@ -355,6 +356,16 @@ export function createE2EBrowserAdapter(
           'Navigation did not reach the requested path'
         );
       }
+    },
+
+    async leaveSlotGame() {
+      const guardRemoved = slotGuard === null;
+      console.log(`SLOT EXIT GATE: ${JSON.stringify({ slotRunSettled, guardRemoved, decision: slotRunSettled && guardRemoved ? 'leave-game' : 'stop' })}`);
+      if (!slotRunSettled || !guardRemoved) throw new Error('SLOT_EXIT_ORDER_INVALID');
+      await app.open('/');
+      await verifyOrigin();
+      const currentUrl = new URL(await browser.url());
+      if (currentUrl.pathname !== '/') throw new Error('LOBBY_NAVIGATION_FAILED');
     },
  
     async isVisible(selector: string): Promise<boolean> {
@@ -482,6 +493,7 @@ export function createE2EBrowserAdapter(
     },
  
     async playSlot(game: string, spins: number, stake: number) {
+      slotRunSettled = false;
       if (!midscene) throw new SlotRunError('MIDSCENE_SLOT_READER_REQUIRED', 0, 0);
       // Re-check limits here too: the adapter must never trust its caller.
       guardSlotAction({ type: 'spin', spins });
@@ -575,7 +587,8 @@ export function createE2EBrowserAdapter(
             console.log(`SPIN ${spinNumber} WIN CELEBRATION WAIT: ${JSON.stringify({ cleared: result.cleared, finalState: state })}`);
             if (winCelebrationFailureCode(result.cleared)) throw failOverlay(`Win celebration remained after 15000ms: ${JSON.stringify(state)}`);
           }
-          if (state.overlay === 'none' && !state.blocksSpin) {
+          const overlayDecision = decidePreSpinOverlay({ overlay: state.overlay, blocksSpin: state.blocksSpin });
+          if (overlayDecision === 'spin') {
             console.log(`SPIN ${spinNumber} OVERLAY GATE: ${JSON.stringify({ decision: 'spin', state })}`);
             return;
           }
@@ -811,6 +824,7 @@ export function createE2EBrowserAdapter(
         }
         spinResponses.assertComplete();
         if (guard.requests !== spins) throw new Error('SPIN_REQUEST_COUNT_MISMATCH');
+        slotRunSettled = true;
       } catch (error) {
         let code = error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
           ? error.message

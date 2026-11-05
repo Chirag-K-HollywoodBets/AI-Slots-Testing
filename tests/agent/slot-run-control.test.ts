@@ -6,8 +6,9 @@ import {
   decidePreSpinOverlay,
   extractSpinSettlement,
   headerBalanceLagError,
+  headerBalanceUnreadableError,
+  leaveGameThenPollHeaderBalance,
   persistSpinSettlement,
-  pollHeaderBalance,
   spinBalanceMatches,
   spinCollectionFailureCode,
   spinStakeFailureCode,
@@ -92,11 +93,14 @@ describe('slot run controls', () => {
     expect(spinBalanceMatches(100, settlement.firstStakeResponse.stake!, settlement.win, settlement.balance!)).toBe(true);
   });
 
-  it('allows only a positively identified guarded Prize Drops target or no overlay', () => {
+  it('spins through non-blocking Prize Drops and only dismisses a guarded modal OK', () => {
+    expect(decidePreSpinOverlay({ overlay: 'prize_drops', blocksSpin: false })).toBe('spin');
     expect(decidePreSpinOverlay({ overlay: 'prize_drops', blocksSpin: true, targetInsideGuardedZone: true, targetLabel: 'OK' }))
       .toBe('dismiss-prize-drops');
     expect(decidePreSpinOverlay({ overlay: 'prize_drops', blocksSpin: true, targetInsideGuardedZone: true, targetLabel: 'close' })).toBe('stop');
     expect(decidePreSpinOverlay({ overlay: 'prize_drops', blocksSpin: true, targetInsideGuardedZone: false, targetLabel: 'OK' })).toBe('stop');
+    expect(decidePreSpinOverlay({ overlay: 'other', blocksSpin: false })).toBe('stop');
+    expect(decidePreSpinOverlay({ overlay: 'free_spins', blocksSpin: false })).toBe('stop');
     expect(decidePreSpinOverlay({ overlay: 'other', blocksSpin: true })).toBe('stop');
     expect(decidePreSpinOverlay({ overlay: 'none', blocksSpin: false })).toBe('spin');
   });
@@ -153,19 +157,41 @@ describe('slot run controls', () => {
     expect(click).not.toHaveBeenCalled();
   });
 
-  it('polls until the server balance reaches the header and reports lag on timeout', async () => {
-    const values = [100, 99.8];
-    const settled = await pollHeaderBalance(async () => values.shift() ?? 99.8, 99.8,
-      { timeoutMs: 20, intervalMs: 1, pause: async () => undefined });
-    expect(settled).toEqual({ matched: true, lastValue: 99.8 });
+  it('leaves the game before polling and passes when the lobby header catches up', async () => {
+    let gameOpen = true;
+    const values = [1609.94, 1609.74];
+    const leaveGame = vi.fn(async () => { gameOpen = false; });
+    const read = vi.fn(async () => {
+      expect(gameOpen).toBe(false);
+      return values.shift() ?? 1609.74;
+    });
+    const result = await leaveGameThenPollHeaderBalance(leaveGame, read, 1609.74,
+      { timeoutMs: 20_000, intervalMs: 500, pause: async () => undefined });
+    expect(leaveGame).toHaveBeenCalledOnce();
+    expect(read).toHaveBeenCalledTimes(2);
+    expect(result).toEqual({ matched: true, lastValue: 1609.74 });
+  });
 
+  it('reports HEADER_BALANCE_LAG when the lobby header stays stale for 20 seconds', async () => {
     let now = 0;
-    const lag = await pollHeaderBalance(async () => 100, 99.8,
-      { timeoutMs: 2, intervalMs: 1, now: () => now, pause: async (ms) => { now += ms; } });
-    expect(lag).toEqual({ matched: false, lastValue: 100 });
-    expect(headerBalanceLagError(lag.lastValue, 99.8)).toMatchObject({
+    const result = await leaveGameThenPollHeaderBalance(async () => undefined, async () => 1609.94, 1609.74,
+      { timeoutMs: 20_000, intervalMs: 10_000, now: () => now, pause: async (ms) => { now += ms; } });
+    expect(result).toEqual({ matched: false, lastValue: 1609.94 });
+    expect(headerBalanceLagError(result.lastValue, 1609.74)).toMatchObject({
       code: 'HEADER_BALANCE_LAG', stage: 'header-balance-poll',
-      message: 'HEADER_BALANCE_LAG: header=100; server=99.8',
+      message: 'HEADER_BALANCE_LAG: header=1609.94; server=1609.74',
+    });
+  });
+
+  it('reports HEADER_BALANCE_UNREADABLE when no lobby header read parses', async () => {
+    let now = 0;
+    const result = await leaveGameThenPollHeaderBalance(async () => undefined,
+      async () => { throw new Error('INVALID_RAND_AMOUNT'); }, 1609.74,
+      { timeoutMs: 20_000, intervalMs: 10_000, now: () => now, pause: async (ms) => { now += ms; } });
+    expect(result).toEqual({ matched: false, lastValue: null });
+    expect(headerBalanceUnreadableError(1609.74)).toMatchObject({
+      code: 'HEADER_BALANCE_UNREADABLE', stage: 'header-balance-poll',
+      message: 'HEADER_BALANCE_UNREADABLE: header=unreadable; server=1609.74',
     });
   });
 });

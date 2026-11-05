@@ -9,7 +9,7 @@ export type OverlayDecision = 'spin' | 'dismiss-prize-drops' | 'stop';
 
 /** Fail closed: only positively identified Prize Drops OK wholly in-zone may be dismissed. */
 export function decidePreSpinOverlay(input: OverlayDecisionInput): OverlayDecision {
-  if (input.overlay === 'none' && !input.blocksSpin) return 'spin';
+  if (!input.blocksSpin && (input.overlay === 'none' || input.overlay === 'prize_drops')) return 'spin';
   if (input.overlay === 'prize_drops' && input.blocksSpin
     && input.targetInsideGuardedZone === true
     && (input.targetLabel ?? '').trim().toLowerCase() === 'ok') {
@@ -156,6 +156,13 @@ export function spinBalanceMatches(previousBalance: number, stake: number, win: 
 
 export interface HeaderPollResult { matched: boolean; lastValue: number | null }
 
+export interface HeaderPollOptions {
+  timeoutMs?: number;
+  intervalMs?: number;
+  now?: () => number;
+  pause?: (ms: number) => Promise<void>;
+}
+
 export function headerBalanceLagError(headerBalance: number | null, serverBalance: number): Error & { code: string; stage: string } {
   const error = new Error(`HEADER_BALANCE_LAG: header=${headerBalance}; server=${serverBalance}`) as Error & { code: string; stage: string };
   error.code = 'HEADER_BALANCE_LAG';
@@ -163,8 +170,15 @@ export function headerBalanceLagError(headerBalance: number | null, serverBalanc
   return error;
 }
 
+export function headerBalanceUnreadableError(serverBalance: number): Error & { code: string; stage: string } {
+  const error = new Error(`HEADER_BALANCE_UNREADABLE: header=unreadable; server=${serverBalance}`) as Error & { code: string; stage: string };
+  error.code = 'HEADER_BALANCE_UNREADABLE';
+  error.stage = 'header-balance-poll';
+  return error;
+}
+
 export async function pollHeaderBalance(
-  read: () => Promise<number>, expected: number, options: { timeoutMs?: number; intervalMs?: number; now?: () => number; pause?: (ms: number) => Promise<void> } = {},
+  read: () => Promise<number>, expected: number, options: HeaderPollOptions = {},
 ): Promise<HeaderPollResult> {
   const now = options.now ?? Date.now;
   const pause = options.pause ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -182,6 +196,16 @@ export async function pollHeaderBalance(
     await pause(Math.min(options.intervalMs ?? 500, Math.max(0, deadline - now())));
   } while (now() <= deadline);
   return { matched: false, lastValue };
+}
+
+export async function leaveGameThenPollHeaderBalance(
+  leaveGame: () => Promise<void>,
+  read: () => Promise<number>,
+  expected: number,
+  options: HeaderPollOptions = {},
+): Promise<HeaderPollResult> {
+  await leaveGame();
+  return pollHeaderBalance(read, expected, options);
 }
 
 export function structuredSlotError(error: unknown, stage: string, secrets: string[] = []) {
