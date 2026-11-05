@@ -5,6 +5,7 @@ import { waitForBetslip } from '../sports-readiness';
 import type { Screen } from 'e2e';
 import { expect } from 'e2e';
 import type { PlaywrightPageAgent } from '@midscene/web/playwright';
+import type { Page, Response as PlaywrightResponse } from 'playwright';
 import {
   ALLOWED_GAMES,
   ALLOWED_PATHS,
@@ -35,6 +36,7 @@ import {
   SlotSpinResponseCounter,
 } from '../slot-safety';
 import { getSlotGameUrl, navigateToSlotGameUrl } from '../slot-navigation';
+import { canRetrySpin, collectResponseQuietWindow, decidePreSpinOverlay, extractSpinSettlement, persistSpinSettlement, spinBalanceMatches, spinCollectionFailureCode, waitForWinCelebrationClear, winCelebrationFailureCode } from '../slot-run-control';
  
 // ---- Slot settings ----
  
@@ -69,6 +71,8 @@ const QUIET_MS = 4000;
 const FIRST_RESPONSE_TIMEOUT_MS = 30000;
 const MIDSCENE_GAME_READY_TIMEOUT_MS = 120000;
 const MIDSCENE_SPIN_FINISH_TIMEOUT_MS = 120000;
+const GAME_READINESS_PROMPT = 'Games in Olympus is fully loaded and the reels and spin button are visible. An overlay means a modal, popup, or dialog covering the reels or central play area; readiness is false if one is present. The persistent Prize Drops counter widget at top-left (prize count and countdown timer), Buy Free Spins and Double Chance side panels, and bottom control bar are not overlays and never block readiness.';
+const STAKE_READINESS_PROMPT = 'The stake displayed in the game canvas is exactly R0.20 and ante bet is off. An overlay means a modal, popup, or dialog covering the reels or central play area; this check is false if one is present. The persistent top-left Prize Drops counter widget (prize count and countdown timer), Buy Free Spins and Double Chance side panels, and bottom control bar are not overlays and never block this check.';
 
 /** The runner receives only read-only Midscene operations; clicks stay in this adapter. */
 export type ReadOnlyMidscene = Pick<PlaywrightPageAgent, 'aiWaitFor' | 'aiAssert' | 'aiQuery' | 'aiLocate'>;
@@ -98,9 +102,13 @@ export function validateSpinRequest(body: string, confirmedStake: number, armed:
 }
 
 export class SlotRunError extends Error {
-  constructor(message: string, readonly completedSpins: number, readonly attemptedSpins: number) {
-    super(message);
+  constructor(message: string, readonly spinsSettled: number, readonly doSpinRequestsSent: number,
+    readonly doSpinResponsesReceived = 0, readonly settledSpins: SpinResult[] = [], readonly stage = 'spin',
+    readonly requestGuardCounts: Array<Record<string, number>> = [], readonly settlementEvents: Array<Record<string, unknown>> = [],
+    originalError?: unknown) {
+    super(message, { cause: originalError });
     this.name = 'SlotRunError';
+    (this as Error & { code?: string }).code = /^[A-Z0-9_]+$/.test(message) ? message : 'SLOT_RUN_FAILED';
   }
 }
 
@@ -177,6 +185,7 @@ interface GameResponse {
   win: number | null;
   nextAction: string | null;
   freeSpins: boolean;
+  serverFields: { c: number | null; l: number | null; tw: number | null; balance: number | null };
 }
 
 interface SlotOverlayState {
@@ -194,22 +203,7 @@ function normalizeOverlayState(value: unknown): SlotOverlayState {
   return { overlay: record.overlay as SlotOverlayState['overlay'], blocksSpin: record.blocksSpin };
 }
 
-function isWaitConditionTimeout(error: unknown): boolean {
-  const record = error && typeof error === 'object' ? error as Record<string, unknown> : {};
-  const name = typeof record.name === 'string' ? record.name : '';
-  const code = typeof record.code === 'string' ? record.code : '';
-  const message = error instanceof Error ? error.message : String(error);
-  return /wait.?for.*timeout|condition.*(?:timeout|timed out)|(?:timeout|timed out).*condition/i.test(message)
-    || /^(?:AI_)?WAIT_?FOR_?TIMEOUT$/.test(code)
-    || /WaitFor.*Timeout/i.test(name);
-}
-
-function isBrowserResponseTimeout(error: unknown): boolean {
-  const message = error instanceof Error ? error.message : String(error);
-  return /timeout.*(?:waiting|response)|(?:waiting|response).*timeout/i.test(message);
-}
- 
-function parseGameResponse(body: string): GameResponse {
+export function parseGameResponse(body: string): GameResponse {
   // Querystring-style body: "tw=0.00&balance=999.85&c=0.01&l=20&bl=0&na=s&..."
   const p = new URLSearchParams(body.trim());
   // Amounts can use thousands separators ("60,000,000.00").
@@ -217,7 +211,7 @@ function parseGameResponse(body: string): GameResponse {
     const v = p.get(k);
     if (v === null || v === '') return null;
     const n = Number(v.replace(/,/g, ''));
-    return Number.isNaN(n) ? null : n;
+    return Number.isFinite(n) ? n : null;
   };
   const c = num('c');
   const l = num('l');
@@ -228,6 +222,7 @@ function parseGameResponse(body: string): GameResponse {
     win: num('tw'),
     nextAction: p.get('na'),
     freeSpins: (num('fs') ?? 0) > 0,
+    serverFields: { c, l, tw: num('tw'), balance: num('balance') },
   };
 }
  
@@ -237,6 +232,8 @@ export function createE2EBrowserAdapter(
   allowedOrigin: string,
   screen: Screen,
   midscene?: ReadOnlyMidscene,
+  onSpinSettlement?: (event: { spin: number; responseIndex: number; serverFields: GameResponse['serverFields']; doSpinRequestsSent: number; doSpinResponsesReceived: number }) => Promise<void> | void,
+  responsePage?: Pick<Page, 'on' | 'off'>,
 ): BrowserAdapter {
   const origin = new URL(allowedOrigin).origin;
  
@@ -293,6 +290,7 @@ export function createE2EBrowserAdapter(
     blocked: string | null;
     stake: number | null;
     requests: number;
+    sent: number;
     attempted: number;
     expectedSpins: number | null;
   } | null = null;
@@ -300,37 +298,33 @@ export function createE2EBrowserAdapter(
   /** Collects every game-service response for one spin until the game goes quiet. */
   async function collectSpin(
     trigger: () => Promise<void>,
-    onGameResponse: (response: GameResponse) => void,
+    onGameResponse: (response: GameResponse) => Promise<void> | void,
     firstTimeoutMs = FIRST_RESPONSE_TIMEOUT_MS,
   ): Promise<GameResponse[]> {
-    // allSettled, not all: if one half fails, still wait for the other so no
-    // framework step is left running (that fails the test with STEP_NOT_AWAITED).
-    const [waited, pressed] = await Promise.allSettled([
-      browser.waitForResponse(GAME_SERVICE, { timeout: firstTimeoutMs }),
-      trigger(),
-    ]);
-    if (pressed.status === 'rejected') throw new Error('SPIN_KEY_FAILED');
-    if (waited.status === 'rejected') throw new Error('SPIN_RESPONSE_TIMEOUT');
-    const first = waited.value;
- 
-    if (first.status !== 200) throw new Error('SPIN_RESPONSE_FAILED');
-    const firstResponse = parseGameResponse(await first.text());
-    onGameResponse(firstResponse);
-    const responses = [firstResponse];
- 
-    for (;;) {
-      let next;
-      try {
-        next = await browser.waitForResponse(GAME_SERVICE, { timeout: QUIET_MS });
-      } catch (error) {
-        if (isBrowserResponseTimeout(error)) return responses; // timed out waiting = spin finished
-        throw error;
-      }
-      if (next.status !== 200) throw new Error('SPIN_RESPONSE_FAILED');
-      const response = parseGameResponse(await next.text());
-      onGameResponse(response);
-      responses.push(response);
+    if (!responsePage) throw new Error('SPIN_RESPONSE_LISTENER_REQUIRED');
+    const responses: GameResponse[] = [];
+    const window = await collectResponseQuietWindow<PlaywrightResponse>(
+      (listener) => {
+        const onResponse = (response: PlaywrightResponse) => {
+          if (GAME_SERVICE.test(response.url())) listener(response);
+        };
+        responsePage.on('response', onResponse);
+        return () => responsePage.off('response', onResponse);
+      },
+      trigger,
+      async (response) => {
+        if (response.status() !== 200) throw new Error('SPIN_RESPONSE_FAILED');
+        const parsed = parseGameResponse(await response.text());
+        await onGameResponse(parsed);
+        responses.push(parsed);
+      },
+      { firstResponseTimeoutMs: firstTimeoutMs, quietMs: QUIET_MS },
+    );
+    if (window.responseCount === 0) {
+      if (window.triggerError !== undefined) throw new Error('SPIN_KEY_FAILED', { cause: window.triggerError });
+      throw new Error('SPIN_RESPONSE_TIMEOUT');
     }
+    return responses;
   }
  
   const adapter: BrowserAdapter = {
@@ -397,7 +391,7 @@ export function createE2EBrowserAdapter(
 
       // Install the doSpin guard before loading the game. It blocks every spin
       // throughout setup and only permits the exact, armed plan stake later.
-      slotGuard = { armed: false, blocked: null, stake: null, requests: 0, attempted: 0, expectedSpins: null };
+      slotGuard = { armed: false, blocked: null, stake: null, requests: 0, sent: 0, attempted: 0, expectedSpins: null };
       const guard = slotGuard;
       await browser.route(GAME_SERVICE, async (route) => {
         const params = new URLSearchParams(route.request.postData ?? '');
@@ -418,6 +412,7 @@ export function createE2EBrowserAdapter(
           await route.abort();
           return;
         }
+        guard.sent++;
         await route.continue();
       });
  
@@ -467,7 +462,7 @@ export function createE2EBrowserAdapter(
       // Wait for the canvas game to be ready using Midscene's read-only APIs.
       try {
         await midscene.aiWaitFor(
-          'Games in Olympus is fully loaded in the game canvas, the reels are visible, and the spin button is visible.',
+          'This setup wait only verifies that the Games in Olympus canvas, reels, and spin control have initialized; it does not assess readiness for a spin. A central modal, popup, or dialog may be present and will be handled by the pre-spin overlay gate. The persistent top-left Prize Drops counter widget (prize count and countdown timer), Buy Free Spins and Double Chance side panels, and bottom control bar are not overlays.',
           { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
         );
       } catch (error) {
@@ -523,21 +518,15 @@ export function createE2EBrowserAdapter(
         slotGuard = null;
         throw new SlotRunError('STAKE_NOT_R020', 0, 0);
       }
-      try {
-        await midscene.aiAssert('The stake displayed in the game canvas is exactly R0.20 and ante bet is off.');
-      } catch (error) {
-        await browser.unroute(GAME_SERVICE);
-        slotGuard = null;
-        const failure = new SlotRunError('MIDSCENE_STAKE_ASSERT_FAILED', 0, 0);
-        (failure as Error & { cause?: unknown }).cause = error;
-        throw failure;
-      }
- 
       // Network guard: every doSpin request is checked before it leaves the browser.
       // Outside our own spin window, or at any other stake, it is aborted.
       const results: SpinResult[] = [];
       const spinResponses = new SlotSpinResponseCounter(spins);
+      const settlementEvents: Array<{ spin: number; responseIndex: number; serverFields: GameResponse['serverFields'] }> = [];
+      const requestGuardCounts: Array<Record<string, number>> = [];
       const guard = slotGuard;
+      let currentSpinRequestStart = guard?.requests ?? 0;
+      let currentSpinNumber = 1;
       try {
         if (!guard || guard.blocked) throw new Error(guard?.blocked ?? 'GAME_NOT_OPEN');
         guard.stake = stake;
@@ -551,7 +540,7 @@ export function createE2EBrowserAdapter(
           zones: SLOT_NO_CLICK_ZONES,
           bottomCentreDismissGuard: {
             ...SLOT_BOTTOM_CENTRE_GUARD,
-            allowedOnlyWhen: { overlay: 'prize_drops', blocksSpin: true, targetLabels: ['OK', 'close'] },
+            allowedOnlyWhen: { overlay: 'prize_drops', blocksSpin: true, targetLabels: ['OK'] },
           },
           dismissalTargetMargin: SLOT_DISMISS_TARGET_MARGIN,
         }));
@@ -559,37 +548,48 @@ export function createE2EBrowserAdapter(
         const queryOverlayState = async (spinNumber: number): Promise<SlotOverlayState> => {
           const raw = await midscene.aiQuery(
             '{ overlay: "none" | "win_celebration" | "prize_drops" | "free_spins" | "other", blocksSpin: boolean }, ' +
-            `Classify the current overlay in the Games in Olympus game canvas after spin ${spinNumber}. ` +
-            'Use free_spins for any free-spin or bonus feature. Set blocksSpin true only when the overlay prevents a new normal spin. ' +
-            'Prize Drops may remain visible while not blocking the spin. Never interact with the game.',
+            `Before spin ${spinNumber}, an overlay means a modal, popup, or dialog covering the reels or central play area; classify whether one is present. ` +
+            'The persistent top-left Prize Drops counter widget with prize count and countdown timer, Buy Free Spins and Double Chance side panels, and bottom control bar are not overlays and never block a spin. ' +
+            'Use prize_drops only for the central Prize Drops modal with its title, prize pool, and orange OK button. Use free_spins for a free-spin or bonus feature. Set blocksSpin true when a modal, popup, or dialog covers the reels or central play area, even if the spin button is visible behind it. Never interact with the game.',
           ) as unknown;
           const state = normalizeOverlayState(raw);
           console.log(`SPIN ${spinNumber} OVERLAY: ${JSON.stringify(state)}`);
-          if (state.overlay === 'free_spins') throw new Error('FREE_SPINS_TRIGGERED');
           return state;
         };
 
         const clearBlockingOverlay = async (spinNumber: number): Promise<void> => {
+          const failOverlay = (detail: string) => {
+            const error = new Error(detail) as Error & { code?: string; stage?: string };
+            error.code = 'OVERLAY_BLOCKING';
+            error.stage = `pre-spin-overlay-${spinNumber}`;
+            return error;
+          };
           let state = await queryOverlayState(spinNumber);
-          if (state.overlay === 'win_celebration' && state.blocksSpin) {
-            try {
-              await midscene.aiWaitFor(
-                `The win celebration after spin ${spinNumber} has auto-dismissed and no longer blocks a normal spin.`,
-                { timeoutMs: 15000, checkIntervalMs: 1500 },
-              );
-            } catch (error) {
-              if (!isWaitConditionTimeout(error)) throw error;
-              console.log(`SPIN ${spinNumber}: win celebration remained after passive 15000ms wait`);
-            }
-            state = await queryOverlayState(spinNumber);
+          if (state.overlay === 'win_celebration') {
+            const result = await waitForWinCelebrationClear(
+              () => queryOverlayState(spinNumber),
+              (ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)),
+              { intervalMs: 2500, maxWaitMs: 15000, initialState: state },
+            );
+            state = result.state;
+            console.log(`SPIN ${spinNumber} WIN CELEBRATION WAIT: ${JSON.stringify({ cleared: result.cleared, finalState: state })}`);
+            if (winCelebrationFailureCode(result.cleared)) throw failOverlay(`Win celebration remained after 15000ms: ${JSON.stringify(state)}`);
           }
-          if (!state.blocksSpin) return;
+          if (state.overlay === 'none' && !state.blocksSpin) {
+            console.log(`SPIN ${spinNumber} OVERLAY GATE: ${JSON.stringify({ decision: 'spin', state })}`);
+            return;
+          }
+          if (state.overlay !== 'prize_drops' || !state.blocksSpin) {
+            console.log(`SPIN ${spinNumber} OVERLAY GATE: ${JSON.stringify({ decision: 'stop', state })}`);
+            throw failOverlay(JSON.stringify(state));
+          }
+          console.log(`SPIN ${spinNumber} OVERLAY GATE: ${JSON.stringify({ decision: 'dismiss-candidate', state })}`);
 
-          for (let attempt = 1; attempt <= 2; attempt++) {
+          for (let attempt = 1; attempt <= 1; attempt++) {
             const located = await midscene.aiLocate(
-              `The visible close or collapse control for the blocking ${state.overlay} overlay after spin ${spinNumber} in the Games in Olympus game canvas. ` +
-              'For a Prize Drops modal, locate only the button visibly labelled OK or close. Return its rectangle. ' +
-              'Do not locate the spin button, autoplay, plus/bet controls, Buy Free Spins, Double Chance, or ante controls.',
+              `The orange button visibly labelled OK on the central Prize Drops modal covering the reels or central play area before spin ${spinNumber}. ` +
+              'The modal has a Prize Drops title and prize pool. Return only the OK button rectangle. ' +
+              'Do not locate or click the persistent top-left Prize Drops counter widget, Buy Free Spins or Double Chance side panels, bottom control bar, spin button, autoplay, plus/bet, or ante controls.',
             );
             const frame = await frameRect();
             const dpr = located.dpr ?? 1;
@@ -600,24 +600,16 @@ export function createE2EBrowserAdapter(
               width: (located.rect.width / dpr) / frame.w,
               height: (located.rect.height / dpr) / frame.h,
             };
-            const overlapsBottomCentre = (() => {
-              const margin = SLOT_DISMISS_TARGET_MARGIN;
-              const expanded = {
-                left: target.left - margin.x,
-                top: target.top - margin.y,
-                right: target.left + target.width + margin.x,
-                bottom: target.top + target.height + margin.y,
-              };
-              const zone = SLOT_BOTTOM_CENTRE_GUARD;
-              return !(expanded.right <= zone.left || expanded.left >= zone.right
-                || expanded.bottom <= zone.top || expanded.top >= zone.bottom);
-            })();
+            const whollyInBottomCentre = target.left >= SLOT_BOTTOM_CENTRE_GUARD.left
+              && target.top >= SLOT_BOTTOM_CENTRE_GUARD.top
+              && target.left + target.width <= SLOT_BOTTOM_CENTRE_GUARD.right
+              && target.top + target.height <= SLOT_BOTTOM_CENTRE_GUARD.bottom;
             let targetLabel: string | undefined;
-            if (overlapsBottomCentre && state.overlay === 'prize_drops' && state.blocksSpin) {
+            if (whollyInBottomCentre && state.overlay === 'prize_drops' && state.blocksSpin) {
               const labelResult = await midscene.aiQuery(
-                '{ label: "OK" | "close" | "other" }, ' +
-                `Read the visible label on the Prize Drops overlay dismissal control after spin ${spinNumber}, centered at iframe-relative x=${(located.center[0] / dpr - frame.x) / frame.w} and y=${(located.center[1] / dpr - frame.y) / frame.h}. ` +
-                'Return OK only if its visible label is OK, close only if it is visibly a close control, otherwise other.',
+                '{ label: "OK" | "other" }, ' +
+                `Read the visible label on the orange OK button of the central Prize Drops modal before spin ${spinNumber}, centered at iframe-relative x=${(located.center[0] / dpr - frame.x) / frame.w} and y=${(located.center[1] / dpr - frame.y) / frame.h}. ` +
+                'Return OK only if this is the visibly orange OK button on the modal with title and prize pool; otherwise return other.',
               ) as unknown;
               const labelRecord = labelResult && typeof labelResult === 'object'
                 ? labelResult as Record<string, unknown>
@@ -628,6 +620,8 @@ export function createE2EBrowserAdapter(
                   ? labelResult.trim().replace(/^['"]|['"]$/g, '')
                   : undefined;
             }
+            const decision = decidePreSpinOverlay({ overlay: state.overlay, blocksSpin: state.blocksSpin,
+              targetInsideGuardedZone: whollyInBottomCentre, targetLabel });
             const policy = { overlay: state.overlay, blocksSpin: state.blocksSpin, targetLabel };
             const margin = SLOT_DISMISS_TARGET_MARGIN;
             const expandedTarget = {
@@ -645,15 +639,17 @@ export function createE2EBrowserAdapter(
               || expandedTarget.left >= SLOT_BOTTOM_CENTRE_GUARD.right
               || expandedTarget.bottom <= SLOT_BOTTOM_CENTRE_GUARD.top
               || expandedTarget.top >= SLOT_BOTTOM_CENTRE_GUARD.bottom);
-            const safe = isSlotDismissTargetSafe(target, policy);
+            const safe = decision === 'dismiss-prize-drops' && isSlotDismissTargetSafe(target, policy);
             const click = { x: located.center[0] / dpr, y: located.center[1] / dpr };
             console.log(`SPIN ${spinNumber} OVERLAY DISMISS DECISION: ${JSON.stringify({
               decision: safe ? 'ALLOW' : 'REFUSE',
+              targetWhollyInGuardedZone: whollyInBottomCentre,
               overlay: state.overlay,
               blocksSpin: state.blocksSpin,
               targetLabel,
               target,
               click,
+              clickIframe: { x: (located.center[0] / dpr - frame.x) / frame.w, y: (located.center[1] / dpr - frame.y) / frame.h },
               protectedZones: zoneDecisions,
               bottomCentreIntersects,
             })}`);
@@ -664,58 +660,123 @@ export function createE2EBrowserAdapter(
             console.log(`SPIN ${spinNumber} DISMISS overlay=${state.overlay} attempt=${attempt} target=${JSON.stringify(target)}`);
             await clickAt(click.x, click.y);
             state = await queryOverlayState(spinNumber);
-            if (!state.blocksSpin) return;
+            if (state.overlay === 'none' && !state.blocksSpin) {
+              console.log(`SPIN ${spinNumber} OVERLAY VERIFY: gone`);
+              return;
+            }
           }
-          throw new Error('OVERLAY_DISMISS_FAILED');
+          throw failOverlay(`Prize Drops remained after dismissal: ${JSON.stringify(state)}`);
         };
  
         for (let i = 0; i < spins; i++) {
-          // Check the cumulative spin count immediately before each spin attempt.
+          currentSpinNumber = i + 1;
+          currentSpinRequestStart = guard.requests;
+          requestGuardCounts.push({ spin: i + 1, clickAttempt: 0, requestsSeen: 0, requestsSent: 0,
+            responsesReceived: spinResponses.count });
+          // Re-enforce the total spend cap and remembered R0.20/ante-off state at every spin boundary.
           guardSlotAction({ type: 'spin', spins: i + 1 });
+          guardSlotAction({ type: 'wager', wager: stake });
+          if (Math.round((i + 1) * stake * 100) > Math.round(spins * 0.2 * 100)) throw new Error('SPEND_CAP_EXCEEDED');
+          if (stake !== 0.2 || gameState.stake !== stake || gameState.anteOn) throw new Error('STAKE_MISMATCH');
           if (guard.blocked) throw new Error(guard.blocked);
-          let responses: GameResponse[];
-          guard.armed = true;
-          try {
-            responses = await collectSpin(
-              () => clickAt(spinButton.x, spinButton.y),
-              (response) => {
-                if (response.stake !== null) {
-                  const responseCount = spinResponses.recordDoSpinResponse();
-                  console.log(`doSpin response ${responseCount}/${spins} received from gameService`);
-                }
-              },
-              10000,
-            );
-          } finally {
-            guard.armed = false;
+          await clearBlockingOverlay(i + 1);
+          await midscene.aiWaitFor(
+            GAME_READINESS_PROMPT,
+            { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
+          );
+          await midscene.aiAssert(STAKE_READINESS_PROMPT);
+          const preSpinGuard = requestGuardCounts.at(-1)!;
+          preSpinGuard.requestsSeen = guard.requests - currentSpinRequestStart;
+          preSpinGuard.requestsSent = guard.sent - (results.at(-1)?.doSpinRequestsSent ?? 0);
+          if (guard.blocked || guard.requests !== currentSpinRequestStart) {
+            throw new Error(guard.blocked ?? 'SPIN_OUTCOME_UNKNOWN');
+          }
+          let responses: GameResponse[] = [];
+          let responseIndex = 0;
+          const responseHandler = async (response: GameResponse) => {
+            responseIndex++;
+            const responseCount = response.stake !== null
+              ? spinResponses.recordDoSpinResponse()
+              : spinResponses.count;
+            const event = { spin: i + 1, responseIndex, serverFields: response.serverFields };
+            persistSpinSettlement(settlementEvents, event);
+            console.log(`gameService response fields: ${JSON.stringify({ ...event, doSpinResponsesReceived: responseCount })}`);
+            await onSpinSettlement?.({ ...event, doSpinRequestsSent: guard.sent, doSpinResponsesReceived: responseCount });
+          };
+          for (let clickAttempt = 0; clickAttempt < 2; clickAttempt++) {
+            const requestStart = guard.requests;
+            const sentStart = guard.sent;
+            guard.armed = true;
+            try {
+              responses = await collectSpin(() => clickAt(spinButton.x, spinButton.y), responseHandler, 10000);
+              requestGuardCounts.push({ spin: i + 1, clickAttempt: clickAttempt + 1,
+                requestsSeen: guard.requests - requestStart, requestsSent: guard.sent - sentStart,
+                responsesReceived: spinResponses.count });
+              break;
+            } catch (error) {
+              guard.armed = false;
+              const requestsForSpin = guard.requests - requestStart;
+              requestGuardCounts.push({ spin: i + 1, clickAttempt: clickAttempt + 1,
+                requestsSeen: requestsForSpin, requestsSent: guard.sent - sentStart,
+                responsesReceived: spinResponses.count });
+              if (requestsForSpin > 0) {
+                const unknown = new Error(spinCollectionFailureCode(0, requestsForSpin) ?? 'SPIN_RESPONSE_TIMEOUT', { cause: error }) as Error & { code?: string; stage?: string };
+                unknown.code = spinCollectionFailureCode(0, requestsForSpin) ?? 'SPIN_RESPONSE_TIMEOUT';
+                unknown.stage = 'awaiting-spin-settlement';
+                throw unknown;
+              }
+              if (clickAttempt > 0) throw error;
+              console.log(`SPIN ${i + 1} NO REQUEST: rechecking overlay, readiness and stake before its single retry`);
+              await clearBlockingOverlay(i + 1);
+              await midscene.aiWaitFor(
+                GAME_READINESS_PROMPT,
+                { timeoutMs: MIDSCENE_GAME_READY_TIMEOUT_MS, checkIntervalMs: 2000 },
+              );
+              await midscene.aiAssert(STAKE_READINESS_PROMPT);
+              if (guard.requests !== requestStart) throw new Error('SPIN_OUTCOME_UNKNOWN');
+              if (!canRetrySpin(requestsForSpin, clickAttempt, true, true)) throw error;
+            } finally {
+              guard.armed = false;
+            }
           }
           if (guard.blocked) throw new Error(guard.blocked);
  
           // The spin's own response is the first one carrying a stake; a late
           // doCollect from the previous win can arrive ahead of it and has none.
-          const first = responses.find((r) => r.stake !== null);
-          if (!first) throw new Error('SPIN_RESPONSE_UNRECOGNISED');
+          const extracted = extractSpinSettlement(responses);
+          const first = extracted.firstStakeResponse;
           // Second check, from the server's side.
           if (first.stake !== stake || first.anteOn) throw new Error('STAKE_MISMATCH');
  
-          // Win and balance come from the last responses that carry them
-          // (doSpin, any tumbles, then doCollect when there was a win).
-          const win = [...responses].reverse().find((r) => r.win !== null)?.win ?? 0;
-          const balance = [...responses].reverse().find((r) => r.balance !== null)?.balance ?? null;
+          // The first response carrying the server stake is the authoritative doSpin settlement.
+          const win = extracted.win;
+          const balance = extracted.balance;
  
           // Hard check, confirmed on losing and winning spins: new balance must equal
           // previous balance - stake + win. Stop before the next spin if it doesn't.
           if (balance === null) throw new Error('BALANCE_NOT_REPORTED');
           if (previousBalance !== null) {
             const expected = round2(previousBalance - stake + win);
-            if (round2(balance) !== expected) {
+            if (!spinBalanceMatches(previousBalance, stake, win, balance)) {
               console.log(`BALANCE CHECK spin ${i + 1}: expected ${expected}, got ${balance}`);
               throw new Error('BALANCE_MISMATCH');
             }
           }
 
           console.log(`SPIN ${i + 1} SETTLED: stake=R${first.stake.toFixed(2)} win=R${win.toFixed(2)} balance=R${balance.toFixed(2)}`);
-          results.push({ stake: first.stake, win, balance });
+          const settled: SpinResult = {
+            spin: i + 1,
+            stake: first.stake,
+            win,
+            balance,
+            serverFields: extracted.serverFields,
+            doSpinRequestsSent: guard.sent,
+            doSpinResponsesReceived: spinResponses.count,
+            frameRect: { x: rect.x, y: rect.y, w: rect.w, h: rect.h },
+            spinClick: { iframe: { x: SPIN_BUTTON.fx, y: SPIN_BUTTON.fy }, page: { x: spinButton.x, y: spinButton.y } },
+            requestGuardCounts: requestGuardCounts.filter((entry) => entry.spin === i + 1),
+          };
+          results.push(settled);
           previousBalance = balance;
           if (responses.some((r) => r.freeSpins)) {
             console.log(`SLOT RUN STOP: free spins or bonus feature triggered after spin ${i + 1}`);
@@ -732,16 +793,27 @@ export function createE2EBrowserAdapter(
             throw new Error(`MIDSCENE_SPIN_FINISH_FAILED_${i + 1}`, { cause: error });
           }
 
-          await clearBlockingOverlay(i + 1);
+          const afterSpinOverlay = await queryOverlayState(i + 1);
+          console.log(`SPIN ${i + 1} POST-SPIN OVERLAY: ${JSON.stringify(afterSpinOverlay)}`);
+          if (afterSpinOverlay.overlay === 'free_spins') throw new Error('FREE_SPINS_TRIGGERED');
           if (guard.blocked) throw new Error(guard.blocked);
         }
         spinResponses.assertComplete();
         if (guard.requests !== spins) throw new Error('SPIN_REQUEST_COUNT_MISMATCH');
       } catch (error) {
-        const code = error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
+        let code = error instanceof Error && /^[A-Z0-9_]+$/.test(error.message)
           ? error.message
-          : 'SLOT_RUN_FAILED';
-        throw new SlotRunError(code, spinResponses.count, guard?.attempted ?? 0);
+          : (error as { code?: string } | null)?.code ?? 'SLOT_RUN_FAILED';
+        let stage = (error as { stage?: string } | null)?.stage ?? 'spin';
+        const hasParsedSpinResponse = settlementEvents.some((event) => event.spin === currentSpinNumber);
+        if ((guard?.requests ?? 0) > currentSpinRequestStart && results.length < currentSpinNumber
+          && (!hasParsedSpinResponse || code === 'BALANCE_NOT_REPORTED')) {
+          code = 'SPIN_OUTCOME_UNKNOWN';
+          stage = 'awaiting-spin-settlement';
+        }
+        throw new SlotRunError(code, results.length, guard?.sent ?? 0, spinResponses.count, results,
+          stage, requestGuardCounts,
+          settlementEvents.map((event) => ({ ...event })), error);
       } finally {
         await browser.unroute(GAME_SERVICE);
         slotGuard = null;

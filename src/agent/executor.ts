@@ -66,9 +66,18 @@ type PlaySlotAction = Extract<AgentAction, { type: 'play_slot' }>;
 type OtherAgentAction = Exclude<AgentAction, PlaySlotAction>;
 
 export interface SlotFailureObservation {
-  completedSpins: number;
-  attemptedSpins: number;
+  spinsSettled: number;
+  doSpinRequestsSent: number;
+  doSpinResponsesReceived: number;
   stoppedBeforeAnySpin: boolean;
+  stage: string;
+  code: string;
+  name: string;
+  message: string;
+  cause?: string;
+  settledSpins?: SlotSpinResult[];
+  requestGuardCounts?: Array<Record<string, number>>;
+  settlementEvents?: Array<Record<string, unknown>>;
 }
 
 export type ActionResult =
@@ -147,6 +156,12 @@ export async function executePlan(
             totalStaked: spins.reduce((s, x) => s + asCents(x.stake), 0) / 100,
             totalWon: spins.reduce((s, x) => s + asCents(x.win), 0) / 100,
             finalBalance: spins.at(-1)?.balance ?? null,
+            doSpinRequestsSent: spins.at(-1)?.doSpinRequestsSent ?? spins.length,
+            doSpinResponsesReceived: spins.at(-1)?.doSpinResponsesReceived ?? spins.length,
+            spinsSettled: spins.length,
+            ...(spins.at(-1)?.frameRect ? { frameRect: spins.at(-1)!.frameRect } : {}),
+            ...(spins.at(-1)?.spinClick ? { spinClick: spins.at(-1)!.spinClick } : {}),
+            requestGuardCounts: spins.flatMap((spin) => spin.requestGuardCounts ?? []),
           };
           observation = slotObservation;
           break;
@@ -172,14 +187,41 @@ export async function executePlan(
     } catch (error) {
       // Only expose our own short error codes, never raw page/network text.
       const message = error instanceof Error ? error.message : '';
-      const slotFailure = error instanceof Error && 'completedSpins' in error && 'attemptedSpins' in error
-        ? {
-          completedSpins: Number(error.completedSpins),
-          attemptedSpins: Number(error.attemptedSpins),
-          stoppedBeforeAnySpin: Number(error.attemptedSpins) === 0,
-        }
+      const slotFailure = error instanceof Error && 'spinsSettled' in error && 'doSpinRequestsSent' in error
+        ? (() => {
+          const failure = error as Error & Record<string, unknown>;
+          const redact = (text: string) => [process.env.MIDSCENE_MODEL_API_KEY, process.env.LLM_API_KEY, process.env.OPENAI_API_KEY,
+            process.env.E2E_USER_HB_TEST_USERNAME, process.env.E2E_USER_HB_TEST_PASSWORD]
+            .filter((secret): secret is string => Boolean(secret))
+            .reduce((safe, secret) => safe.replaceAll(secret, '[REDACTED]'), text);
+          const causeText = (value: unknown, depth = 0): string => {
+            if (depth >= 4 || value === undefined) return '';
+            const causeError = value instanceof Error ? value : null;
+            const causeRecord = value && typeof value === 'object' ? value as Record<string, unknown> : {};
+            const label = causeError ? `${causeError.name}: ${causeError.message}` : String(value);
+            const nested = causeText(causeRecord.cause, depth + 1);
+            return redact(`${label}${nested ? `; cause: ${nested}` : ''}`);
+          };
+          const cause = failure.cause;
+          return {
+            spinsSettled: Number(failure.spinsSettled),
+            doSpinRequestsSent: Number(failure.doSpinRequestsSent),
+            doSpinResponsesReceived: Number(failure.doSpinResponsesReceived ?? 0),
+            stoppedBeforeAnySpin: Number(failure.doSpinRequestsSent) === 0,
+            stage: String(failure.stage ?? 'spin'),
+            code: String(failure.code ?? (error.message || 'SLOT_RUN_FAILED')),
+            name: error.name,
+            message: redact(error.message),
+            ...(cause === undefined ? {} : { cause: causeText(cause) }),
+            settledSpins: failure.settledSpins as SlotSpinResult[] | undefined,
+            requestGuardCounts: failure.requestGuardCounts as Array<Record<string, number>> | undefined,
+            settlementEvents: failure.settlementEvents as Array<Record<string, unknown>> | undefined,
+          };
+        })()
         : undefined;
-      const safeError = /^[A-Z_]+$/.test(message) ? message : 'Browser action failed';
+      const errorCode = error && typeof error === 'object' && 'code' in error
+        && typeof error.code === 'string' ? error.code : null;
+      const safeError = errorCode ?? (/^[A-Z0-9_]+$/.test(message) ? message : 'Browser action failed');
       if (action.type === 'play_slot') {
         results.push({ action, success: false, ...(slotFailure ? { observation: slotFailure } : {}), error: safeError });
       } else {

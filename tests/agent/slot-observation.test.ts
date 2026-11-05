@@ -7,16 +7,16 @@ describe('slot executor observation settlement', () => {
     {
       label: 'one spin',
       before: 100,
-      spins: [{ stake: 0.2, win: 0.5, balance: 100.3 }],
+      spins: [{ spin: 1, stake: 0.2, win: 0.5, balance: 100.3, serverFields: [{ c: 0.01, l: 20, tw: 0.5, balance: 100.3 }] }],
       expected: 100.3,
     },
     {
       label: 'three spins',
       before: 100,
       spins: [
-        { stake: 0.2, win: 0, balance: 99.8 },
-        { stake: 0.2, win: 0.15, balance: 99.75 },
-        { stake: 0.2, win: 0.5, balance: 100.05 },
+        { spin: 1, stake: 0.2, win: 0, balance: 99.8, serverFields: [{ c: 0.01, l: 20, tw: 0, balance: 99.8 }] },
+        { spin: 2, stake: 0.2, win: 0.15, balance: 99.75, serverFields: [{ c: 0.01, l: 20, tw: 0.15, balance: 99.75 }] },
+        { spin: 3, stake: 0.2, win: 0.5, balance: 100.05, serverFields: [{ c: 0.01, l: 20, tw: 0.5, balance: 100.05 }] },
       ],
       expected: 100.05,
     },

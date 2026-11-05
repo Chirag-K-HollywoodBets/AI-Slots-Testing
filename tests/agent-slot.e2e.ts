@@ -13,6 +13,7 @@ import { executePlan, type ActionResult, type SuccessfulPlaySlotActionResult } f
 import { isWagerPlan, needsAuth, PlannerPlanSchema } from '../src/agent/schema';
 import { createE2EBrowserAdapter, type ReadOnlyMidscene } from '../src/agent/adapters/e2e-browser';
 import { parseRand, settleSlotObservation, type SlotObservation } from '../src/agent/slot-settlement';
+import { headerBalanceLagError, pollHeaderBalance, structuredSlotError } from '../src/agent/slot-run-control';
 import { configureMidsceneModel, logMidsceneModelConfig } from '../src/agent/midscene-model';
 
 const SITE_URL = 'https://www.hollywoodbets.net/';
@@ -40,6 +41,7 @@ function redactModelSecret(text: string): string {
   const secrets = [
     process.env.MIDSCENE_MODEL_API_KEY,
     process.env.LLM_API_KEY,
+    process.env.OPENAI_API_KEY,
     process.env.E2E_USER_HB_TEST_USERNAME,
     process.env.E2E_USER_HB_TEST_PASSWORD,
   ].filter(
@@ -129,6 +131,9 @@ test(
       balanceBefore: null,
       gameState: null,
       spinResults: [],
+      doSpinRequestsSent: 0,
+      doSpinResponsesReceived: 0,
+      spinsSettled: 0,
       overlayEvents: 'See run.log for overlay classifications, dismissal coordinates, and zone decisions.',
       screenshots: [],
     };
@@ -262,7 +267,16 @@ test(
       if (balanceBefore === null) throw new Error('HEADER_BALANCE_BEFORE_MISSING');
       evidenceState = { ...evidenceState, balanceBefore, headerBalanceBefore: balanceBeforeText };
 
-      const adapter = createE2EBrowserAdapter(browser, app, SITE_URL, screen, midscene);
+      const adapter = createE2EBrowserAdapter(browser, app, SITE_URL, screen, midscene, async (event) => {
+        const prior = Array.isArray(evidenceState.settlementEvents)
+          ? evidenceState.settlementEvents as Array<Record<string, unknown>> : [];
+        const settlementEvents = [...prior, event];
+        evidenceState = { ...evidenceState, settlementEvents,
+          doSpinRequestsSent: event.doSpinRequestsSent,
+          doSpinResponsesReceived: event.doSpinResponsesReceived };
+        await saveReport({ settlementEvents, doSpinRequestsSent: event.doSpinRequestsSent,
+          doSpinResponsesReceived: event.doSpinResponsesReceived });
+      }, midscenePage);
       const started = Date.now();
       const report = await runPhase('Open Games in Olympus, verify R0.20, and play the confirmed spins', async () =>
         executePlan(plan, adapter));
@@ -283,8 +297,9 @@ test(
             const observation: SlotObservation = r.observation;
             details.result = {
               ...observation,
-              completedSpins: observation.spins.length,
-              attemptedSpins: observation.spins.length,
+              doSpinRequestsSent: observation.doSpinRequestsSent,
+              doSpinResponsesReceived: observation.doSpinResponsesReceived,
+              spinsSettled: observation.spinsSettled,
               stoppedBeforeAnySpin: false,
             };
           } else {
@@ -301,6 +316,8 @@ test(
       });
 
       if (!report.success) {
+        const slotFailure = actionReports.find((action) => action.type === 'play_slot' && action.success === false)?.result as
+          { spinsSettled?: number; doSpinRequestsSent?: number; doSpinResponsesReceived?: number; settledSpins?: unknown[]; requestGuardCounts?: unknown[]; settlementEvents?: unknown[]; stage?: string; code?: string; name?: string; message?: string; cause?: string } | null;
         const failedReport = {
           status: 'FAIL',
           success: false,
@@ -309,6 +326,16 @@ test(
           balanceBefore,
           headerBalanceBefore: balanceBeforeText,
           gameState,
+          spinsSettled: slotFailure?.spinsSettled ?? 0,
+          doSpinRequestsSent: slotFailure?.doSpinRequestsSent ?? 0,
+          doSpinResponsesReceived: slotFailure?.doSpinResponsesReceived ?? 0,
+          spinResults: slotFailure?.settledSpins ?? [],
+          requestGuardCounts: slotFailure?.requestGuardCounts ?? [],
+          settlementEvents: slotFailure?.settlementEvents ?? [],
+          ...(slotFailure ? { error: { stage: slotFailure.stage, code: slotFailure.code, name: slotFailure.name,
+            message: slotFailure.message, cause: slotFailure.cause }, reason: slotFailure.code } : {}),
+          ...(slotFailure?.settledSpins?.length ? { frameRect: (slotFailure.settledSpins.at(-1) as { frameRect?: unknown })?.frameRect,
+            spinClick: (slotFailure.settledSpins.at(-1) as { spinClick?: unknown })?.spinClick } : {}),
           ...(midsceneFailure ? { midsceneFailure } : {}),
           actions: actionReports,
         };
@@ -334,6 +361,12 @@ test(
       evidenceState = {
         ...evidenceState,
         spinResults,
+        doSpinRequestsSent: slotObservation.doSpinRequestsSent,
+        doSpinResponsesReceived: slotObservation.doSpinResponsesReceived,
+        spinsSettled: slotObservation.spinsSettled,
+        frameRect: slotObservation.frameRect,
+        spinClick: slotObservation.spinClick,
+        requestGuardCounts: slotObservation.requestGuardCounts,
         settlement: {
           totalStaked: settlement.totalStaked,
           totalWon: settlement.totalWon,
@@ -343,43 +376,45 @@ test(
 
       const balanceAfterText = await runPhase('Read header balance after the spins and compare', async () => {
         await expect(balanceLocator).toBeVisible({ timeout: 20_000 });
-        const value = (await balanceLocator.textContent())?.trim() ?? '';
-        const headerBalanceAfter = parseRand(value);
-        console.log(`Balance after (header): ${value} => R${headerBalanceAfter.toFixed(2)}`);
-
-        if (headerBalanceAfter === settledBalanceBefore) {
+        const serverBalance = slotObservation.finalBalance;
+        if (serverBalance === null || !Number.isFinite(serverBalance)) throw new Error('BALANCE_NOT_REPORTED');
+        if (Math.round(serverBalance * 100) !== Math.round(settlement.expectedBalance * 100)) {
+          throw new Error('BALANCE_MISMATCH');
+        }
+        const polled = await pollHeaderBalance(async () => {
+          const value = (await balanceLocator.textContent())?.trim() ?? '';
+          return parseRand(value);
+        }, serverBalance, { timeoutMs: 10_000, intervalMs: 500 });
+        console.log(`Balance after (header poll): expectedServer=R${serverBalance.toFixed(2)} lastHeader=${polled.lastValue === null ? 'unreadable' : `R${polled.lastValue.toFixed(2)}`} matched=${polled.matched}`);
+        balanceAfterState.value = serverBalance;
+        if (!polled.matched) {
+          const lag = headerBalanceLagError(polled.lastValue, serverBalance);
+          await saveReport({ status: 'FAIL', success: false, error: structuredSlotError(lag, 'header-balance-poll'), durationMs,
+            plan, balanceBefore, balanceAfter: serverBalance, headerBalanceLast: polled.lastValue, gameState, spinResults, actions: actionReports });
+          throw lag;
+        }
+        try {
           const visual = await midscene.aiQuery(
-            '{ balance: number }, read the current in-game balance shown in the game canvas as a South African rand amount. Return only the numeric balance, without currency symbols.'
+            '{ balance: number }, read the current in-game balance shown in the game canvas as a secondary cross-check only. Return only the numeric balance, without currency symbols.'
           ) as unknown;
           const visualValue = typeof visual === 'object' && visual !== null && 'balance' in visual
             ? (visual as { balance: unknown }).balance
             : visual;
           midsceneBalance = parseRand(typeof visualValue === 'string' || typeof visualValue === 'number' ? visualValue : null);
-          console.log(`Balance fallback (Midscene): ${JSON.stringify(visual)} => R${midsceneBalance.toFixed(2)}`);
-          balanceAfterState.value = midsceneBalance;
-        } else {
-          balanceAfterState.value = headerBalanceAfter;
+          console.log(`Balance secondary cross-check (Midscene): ${JSON.stringify(visual)} => R${midsceneBalance.toFixed(2)}; authoritative=doSpin response`);
+        } catch (error) {
+          console.log(`Balance secondary cross-check unavailable: ${error instanceof Error ? error.name : typeof error}; authoritative=doSpin response`);
         }
 
-        const balanceAfter = balanceAfterState.value;
-        if (balanceAfter === null || !Number.isFinite(balanceAfter) || balanceAfter < 0) {
-          throw new Error('BALANCE_AFTER_INVALID');
-        }
-        console.log(`Balance settlement: before=R${settledBalanceBefore.toFixed(2)} spins=${spinResults.length} staked=R${settlement.totalStaked.toFixed(2)} totalWon=R${settlement.totalWon.toFixed(2)} expected=R${settlement.expectedBalance.toFixed(2)} actual=R${balanceAfter.toFixed(2)}`);
+        const balanceAfter = serverBalance;
+        console.log(`Balance settlement: before=R${settledBalanceBefore.toFixed(2)} spins=${spinResults.length} staked=R${settlement.totalStaked.toFixed(2)} totalWon=R${settlement.totalWon.toFixed(2)} expected=R${settlement.expectedBalance.toFixed(2)} server=R${serverBalance.toFixed(2)} header=${polled.lastValue === null ? 'unreadable' : `R${polled.lastValue.toFixed(2)}`}`);
         const settlementEvidence = evidenceState.settlement as Record<string, unknown>;
         evidenceState = {
           ...evidenceState,
           balanceAfter,
           settlement: { ...settlementEvidence, actualBalance: balanceAfter },
         };
-        if (balanceAfter !== settlement.expectedBalance) {
-          await saveReport({
-            status: 'FAIL', success: false, reason: 'BALANCE_SETTLEMENT_MISMATCH', durationMs,
-            plan, balanceBefore, balanceAfter, gameState, spinResults, actions: actionReports,
-          });
-          throw new Error('BALANCE_SETTLEMENT_MISMATCH');
-        }
-        return value;
+        return polled.lastValue!.toFixed(2);
       });
       const balanceAfter = balanceAfterState.value;
       if (balanceAfter === null) throw new Error('BALANCE_AFTER_INVALID');
@@ -395,6 +430,12 @@ test(
         headerBalanceAfter: balanceAfterText,
         gameState,
         spinResults,
+        doSpinRequestsSent: slotObservation.doSpinRequestsSent,
+        doSpinResponsesReceived: slotObservation.doSpinResponsesReceived,
+        spinsSettled: slotObservation.spinsSettled,
+        frameRect: slotObservation.frameRect,
+        spinClick: slotObservation.spinClick,
+        requestGuardCounts: slotObservation.requestGuardCounts,
         settlement: {
           totalStaked: settlement.totalStaked,
           totalWon: settlement.totalWon,
@@ -409,11 +450,16 @@ test(
       console.log('Execution report:', JSON.stringify(safeReport, null, 2));
     } catch (error) {
       if (!savedReportState.value || savedReportState.value.status === 'RUNNING') {
-        const message = error instanceof Error ? error.message : '';
+        const details = structuredSlotError(error, 'slot-run', [
+          process.env.MIDSCENE_MODEL_API_KEY ?? '', process.env.LLM_API_KEY ?? '',
+          process.env.OPENAI_API_KEY ?? '',
+          process.env.E2E_USER_HB_TEST_USERNAME ?? '', process.env.E2E_USER_HB_TEST_PASSWORD ?? '',
+        ]);
         await saveReport({
           status: 'FAIL',
           success: false,
-          reason: /^[A-Z0-9_]+$/.test(message) ? message : 'SLOT_RUN_FAILED',
+          error: details,
+          reason: details.code,
           ...(midsceneFailure ? { midsceneFailure } : {}),
         });
       }

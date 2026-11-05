@@ -338,11 +338,11 @@ function render(status, response, result, options = {}) {
   const slotAction = (result.actions || []).find((action) => action.type === 'play_slot');
   if (!options.restoring) setPhase(result.conversation?.phase || 'idle');
   const slotResult = slotAction && slotAction.result;
-  const slotProgress = slotResult && Number.isInteger(slotResult.completedSpins)
+  const slotProgress = slotResult && Number.isInteger(slotResult.spinsSettled)
     ? slotResult.stoppedBeforeAnySpin
       ? '\nSlot run stopped before any spin; 0 spins completed.'
       : '\nSlot run ' + (slotAction.success ? 'completed ' : 'stopped after ') +
-        slotResult.completedSpins + ' verified spin(s); ' + slotResult.attemptedSpins + ' spin(s) were attempted.'
+        slotResult.spinsSettled + ' settled spin(s); ' + slotResult.doSpinRequestsSent + ' doSpin request(s) were sent.'
     : '';
   status.textContent =
     (result.status || (result.success ? 'PASS' : 'FAIL')) +

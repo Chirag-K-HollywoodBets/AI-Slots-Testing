@@ -192,9 +192,12 @@ describe('Browser Executor', () => {
     expect(browser.playSlot).not.toHaveBeenCalled();
   });
 
-  it('reports a pre-spin failure as zero completed and zero attempted spins', async () => {
+  it('reports a pre-spin failure with zero requests and zero settled spins', async () => {
     const browser = mockBrowser();
-    const failure = Object.assign(new Error('BET_NOT_AT_STAKE'), { completedSpins: 0, attemptedSpins: 0 });
+    const failure = Object.assign(new Error('BET_NOT_AT_STAKE'), {
+      code: 'BET_NOT_AT_STAKE', stage: 'pre-spin', spinsSettled: 0,
+      doSpinRequestsSent: 0, doSpinResponsesReceived: 0,
+    });
     vi.mocked(browser.playSlot).mockRejectedValue(failure);
     const report = await executePlan({
       thought: 'Play the verified stake',
@@ -203,8 +206,9 @@ describe('Browser Executor', () => {
         { type: 'play_slot', game: 'games-in-olympus', spins: 2, stake: 0.2 },
       ],
     }, browser);
-    expect(report.results[1].observation).toEqual({
-      completedSpins: 0, attemptedSpins: 0, stoppedBeforeAnySpin: true,
+    expect(report.results[1].observation).toMatchObject({
+      spinsSettled: 0, doSpinRequestsSent: 0, doSpinResponsesReceived: 0,
+      stoppedBeforeAnySpin: true, stage: 'pre-spin', code: 'BET_NOT_AT_STAKE',
     });
   });
 

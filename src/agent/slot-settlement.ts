@@ -5,9 +5,16 @@ export interface SlotReadout {
 }
 
 export interface SlotSpinResult {
+  spin: number;
   stake: number;
   win: number;
   balance: number;
+  serverFields: Array<{ c: number | null; l: number | null; tw: number | null; balance: number | null }>;
+  doSpinRequestsSent?: number;
+  doSpinResponsesReceived?: number;
+  frameRect?: { x: number; y: number; w: number; h: number };
+  spinClick?: { iframe: { x: number; y: number }; page: { x: number; y: number } };
+  requestGuardCounts?: Array<Record<string, number>>;
 }
 
 /** Stable executor observation returned by a successful play_slot action. */
@@ -16,6 +23,12 @@ export interface SlotObservation {
   totalStaked: number;
   totalWon: number;
   finalBalance: number | null;
+  doSpinRequestsSent: number;
+  doSpinResponsesReceived: number;
+  spinsSettled: number;
+  frameRect?: { x: number; y: number; w: number; h: number };
+  spinClick?: { iframe: { x: number; y: number }; page: { x: number; y: number } };
+  requestGuardCounts?: Array<Record<string, number>>;
 }
 
 export interface SlotObservationSettlement {
